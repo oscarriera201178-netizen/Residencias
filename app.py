@@ -1,4 +1,3 @@
-import streamlit as st
-
-st.title("¡Mi primera aplicación!")
-st.write("Hola, esta aplicación ya está en línea con Streamlit.")
+nombre = st.text_input("Ingrese su nombre:")
+if st.button("Saludar"):
+    st.success(f"¡Bienvenido, {nombre}!")
