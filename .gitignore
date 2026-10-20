@@ -1,3 +1,5 @@
 __pycache__/
 *.py[cod]
 .venv/
+/data/
+/Planilla_de_Ingreso_Completada.pdf
