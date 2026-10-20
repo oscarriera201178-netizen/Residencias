@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 /data/
 /Planilla_de_Ingreso_Completada.pdf
+.env
+.env.*
+.streamlit/secrets.toml

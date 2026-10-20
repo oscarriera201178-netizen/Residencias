@@ -16,6 +16,17 @@ def normalize_invoice_number(value: str) -> str:
     return number
 
 
+def format_resident_display_name(value: str) -> str:
+    parts = value.split()
+    if len(parts) < 2:
+        return " ".join(parts)
+    if len(parts) == 2:
+        return f"{parts[0]}\n{parts[1]}"
+    if len(parts) == 3:
+        return f"{parts[0]} {parts[1][0]}.\n{parts[2]}"
+    return f"{parts[0]} {parts[1][0]}.\n{parts[-2]} {parts[-1][0]}."
+
+
 def format_identity(value: str) -> str:
     value = value.strip().upper()
     prefix_match = _IDENTITY_PREFIX.match(value)

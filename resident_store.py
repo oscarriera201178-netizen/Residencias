@@ -1,11 +1,12 @@
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
-from typing import Generator, TypedDict
+from typing import Callable, Generator, TypedDict
 
 from deposit_receipt import (
     SERVICE_CONCEPTS, generate_deposit_receipt, generate_monthly_receipt, generate_refund_receipt,
@@ -13,7 +14,7 @@ from deposit_receipt import (
 from resident_format import format_identity, format_phone, normalize_invoice_number
 
 
-DATABASE_PATH = Path(__file__).with_name("data") / "residencias.sqlite3"
+DATABASE_PATH = Path(os.environ.get("RESIDENCIAS_DATA_DIR", Path(__file__).parent / "data")) / "residencias.sqlite3"
 PAYMENT_PERIOD = timedelta(days=30)
 ALERT_DAYS = 3
 BANKS = ("Banco de Venezuela", "Banco del Tesoro", "Fondo Común")
@@ -166,6 +167,7 @@ def payment_status(due: date, today: date) -> str:
 
 class ResidentStore:
     def __init__(self, path: Path = DATABASE_PATH):
+        self.authorize_write: Callable[[], None] | None = None
         self.path = path
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.path.touch(mode=0o600, exist_ok=True)
@@ -303,6 +305,10 @@ class ResidentStore:
                 if "invoice_number" not in columns:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN invoice_number TEXT")
 
+    def _require_write(self) -> None:
+        if self.authorize_write is not None:
+            self.authorize_write()
+
     @staticmethod
     def _next_receipt_number(
         connection: sqlite3.Connection, residence: int, kind: str
@@ -340,6 +346,7 @@ class ResidentStore:
         pdf: bytes,
         photo: bytes | None,
     ) -> int:
+        self._require_write()
         values = normalize_admission_values(values)
         missing_assignment = [
             label for field, label in (("room_number", "Habitación"), ("bed_number", "Cama"))
@@ -474,6 +481,7 @@ class ResidentStore:
         return {row["status"]: row["count"] for row in rows}
 
     def delete_admission(self, resident_id: int, residence: int) -> None:
+        self._require_write()
         with self._connect() as connection:
             cursor = connection.execute(
                 "DELETE FROM residents WHERE id = ? AND residence = ? "
@@ -507,6 +515,7 @@ class ResidentStore:
         receiving_bank: str | None = None,
         invoice_number: str = "",
     ) -> None:
+        self._require_write()
         invoice_number = normalize_invoice_number(invoice_number)
         try:
             received_amount = Decimal(amount)
@@ -610,6 +619,7 @@ class ResidentStore:
         receiving_bank: str | None = None,
         invoice_number: str = "",
     ) -> None:
+        self._require_write()
         if concept not in SERVICE_CONCEPTS:
             raise ValueError("Selecciona un concepto de servicio válido.")
         if paid_on > date.today():
@@ -734,6 +744,7 @@ class ResidentStore:
     def set_invoice_number(
         self, residence: int, kind: str, record_id: int, invoice_number: str
     ) -> None:
+        self._require_write()
         tables = {
             "Mensualidad": ("payments", "id"),
             "Depósito de ingreso": ("deposits", "resident_id"),
@@ -759,6 +770,7 @@ class ResidentStore:
         self, residence: int, as_of: date, currency: str,
         payment_method: str, amount: Decimal, description: str,
     ) -> None:
+        self._require_write()
         if as_of > date.today():
             raise ValueError("La fecha del saldo inicial no puede ser futura.")
         methods = {"Efectivo", "Zelle", "Binance"} if currency == "USD" else set(BANKS)
@@ -827,6 +839,7 @@ class ResidentStore:
         self, resident_id: int, residence: int, paid_on: date, payment_method: str,
         amount: Decimal,
     ) -> None:
+        self._require_write()
         if payment_method not in {"Efectivo", "Binance", "Zelle"}:
             raise ValueError("Selecciona efectivo, Binance o Zelle para el depósito.")
         try:
@@ -896,6 +909,7 @@ class ResidentStore:
         return row["receipt_number"] if row else None
 
     def upgrade_legacy_receipts(self) -> int:
+        self._require_write()
         updated = 0
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -943,6 +957,7 @@ class ResidentStore:
         return updated
 
     def regenerate_deposit_receipt(self, resident_id: int, residence: int) -> None:
+        self._require_write()
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -1003,6 +1018,7 @@ class ResidentStore:
         deduction: Decimal = Decimal("0"), deduction_reason: str = "",
         refund_method: str | None = None, refund_confirmed: bool = False,
     ) -> None:
+        self._require_write()
         if not reason.strip():
             raise ValueError("Indica el motivo de la baja.")
         if discharged_on > date.today():

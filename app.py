@@ -1,16 +1,21 @@
+from html import escape
 import json
 import logging
 import sqlite3
-from datetime import date, datetime
+from contextlib import nullcontext
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pymupdf
+import pandas as pd
 import streamlit as st
 
 from deposit_receipt import SERVICE_CONCEPTS, calculate_receipt_vat, format_bolivars
 from monthly_report import generate_monthly_report
 from payment_reminders import MailConfig, VENEZUELA
+from portal_auth import RESIDENCE_NAMES, require_login, render_user_management, select_residence_area
+from resident_format import format_resident_display_name
 from resident_store import (
     ALERT_DAYS, BANKS, ResidentStore, bolivars_from_dollars, calculate_age,
     normalize_admission_values, payment_status,
@@ -570,15 +575,34 @@ def _render_admission_form(tab_index: int, store: ResidentStore) -> None:
         st.rerun()
 
 
-def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
+def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write: bool = True) -> None:
     today = date.today()
-    start = today.replace(day=1)
+    payments = store.received_payments(tab_index, today)
+    opening_balances = store.opening_balances(tab_index, today)
+    report_months = {today.replace(day=1)}
+    for payment in payments:
+        report_months.add(date.fromisoformat(payment["paid_on"]).replace(day=1))
+    for balance in opening_balances:
+        report_months.add(date.fromisoformat(balance["as_of"]).replace(day=1))
+    report_month = st.selectbox(
+        "Mes del informe",
+        sorted(report_months, reverse=True),
+        format_func=lambda month: month.strftime("%m/%Y"),
+        key=f"monthly_received_month_{tab_index}",
+    )
+    start = report_month
+    next_month = date(
+        report_month.year + (report_month.month == 12),
+        report_month.month % 12 + 1,
+        1,
+    )
+    report_through = min(today, next_month - timedelta(days=1))
     st.subheader("Pagos recibidos en el mes")
     notice = st.session_state.pop(f"invoice_notice_{tab_index}", None)
     if notice:
         st.success(notice)
     st.caption(
-        f"Mes actual: {today:%m/%Y}. Mensualidades, depósitos y servicios según la fecha del pago, "
+        f"Mes del informe: {report_month:%m/%Y}. Mensualidades, depósitos y servicios según la fecha del pago, "
         "incluidas residentes que ingresaron antes o que ahora están de baja. "
         "Los acumulados incluyen saldos iniciales y cobros recibidos, no saldo disponible: "
         "no descuentan gastos ni devoluciones."
@@ -597,7 +621,10 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
     monthly_vat = Decimal("0")
     entries = []
     month_payments = []
-    for payment in store.received_payments(tab_index, today):
+    for payment in payments:
+        paid_on = date.fromisoformat(payment["paid_on"])
+        if paid_on > report_through:
+            continue
         currency = payment["currency"]
         raw_amount = payment["amount"]
         valid = currency in current and raw_amount is not None
@@ -610,7 +637,7 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
                 valid = False
         if not valid:
             incomplete += 1
-        in_month = payment["paid_on"] >= start.isoformat()
+        in_month = start <= paid_on < next_month
         if valid and amount is not None and currency is not None:
             totals = current if in_month else previous
             totals[currency] += amount
@@ -649,7 +676,8 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
                 formatted_rate = None
             entries.append({
                 "Fecha": date.fromisoformat(payment["paid_on"]).strftime("%d/%m/%Y"),
-                "Residente": payment["student_name"], "Cédula de identidad": payment["student_id"],
+                "Residente": format_resident_display_name(payment["student_name"]),
+                "Cédula de identidad": payment["student_id"],
                 "Habitación": payment.get("room_number") or "Sin indicar",
                 "Cama": payment.get("bed_number") or "Sin indicar", "Tipo de pago": payment["kind"],
                 "N.º de factura": payment.get("invoice_number") or "Sin indicar",
@@ -685,13 +713,18 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
             "Dólares (USD)": f"{current['USD']:.2f}".replace(".", ","),
         })
         st.markdown("**Resumen de cobros**")
-        st.table(collection_rows)
-        with st.expander("Ingresar o corregir números de factura"):
-            st.caption(
+        collection_table = pd.DataFrame(collection_rows).style.set_properties(
+            subset=["Habitación", "Cama", "N.º de factura"],
+            **{"text-align": "center"},
+        )
+        st.table(collection_table)
+        with st.expander("Ingresar o corregir números de factura") if can_write else nullcontext():
+            if can_write:
+                st.caption(
                 "Guarda el número de la factura entregada para cada pago. "
                 "Es independiente del número automático del recibo. Deja vacío para quitarlo."
             )
-            for payment, entry in zip(month_payments, entries):
+            for payment, entry in zip(month_payments if can_write else [], entries):
                 record_id = payment.get("record_id")
                 if record_id is None:
                     st.warning(
@@ -707,7 +740,8 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
                         else entry["Dólares (USD)"]
                     )
                     st.write(
-                        f"{payment['student_name']} — {payment['student_id']} — "
+                        f"{format_resident_display_name(payment['student_name'])} — "
+                        f"{payment['student_id']} — "
                         f"{payment['kind']} — {payment['paid_on']} — "
                         f"{payment['currency'] or 'Moneda no registrada'} "
                         f"{displayed_amount if displayed_amount != '—' else 'Monto no registrado'}"
@@ -743,7 +777,9 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
     opening = {"VES": Decimal("0"), "USD": Decimal("0")}
     opening_previous = {"VES": Decimal("0"), "USD": Decimal("0")}
     opening_rows = []
-    for balance in store.opening_balances(tab_index, today):
+    for balance in opening_balances:
+        if date.fromisoformat(balance["as_of"]) > report_through:
+            continue
         balance_amount = Decimal(balance["amount"])
         opening[balance["currency"]] += balance_amount
         if balance["as_of"] < start.isoformat():
@@ -822,7 +858,7 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
     )
     try:
         pdf = generate_monthly_report(
-            tab_index, today, collection_rows, summary, warning,
+            tab_index, report_month, collection_rows, summary, warning,
             bank_summary=bank_summary, dollar_summary=dollar_summary,
         )
     except (ValueError, OSError, pymupdf.FileDataError):
@@ -832,9 +868,91 @@ def _render_monthly_received(tab_index: int, store: ResidentStore) -> None:
         st.download_button(
             "Descargar lista de pagos del mes (PDF)",
             data=pdf,
-            file_name=f"Pagos_Recibidos_{tab_index}_{today:%Y_%m}.pdf",
+            file_name=f"Pagos_Recibidos_{tab_index}_{report_month:%Y_%m}.pdf",
             mime="application/pdf", key=f"monthly_received_pdf_{tab_index}",
         )
+
+
+def _render_readonly_residents(tab_index: int, store: ResidentStore, view: int) -> None:
+    labels = {
+        "paid_on": "Fecha del pago", "currency": "Moneda", "amount": "Monto recibido",
+        "payment_method": "Forma de pago", "due_date": "Vencimiento cubierto",
+        "exchange_rate": "Tasa BCV", "exchange_rate_date": "Fecha de la tasa",
+        "amount_usd": "Monto base (USD)", "monthly_amount_usd": "Mensualidad (USD)",
+        "late_fee_usd": "Mora (USD)", "late_days": "Días de retardo",
+        "receiving_bank": "Banco receptor", "invoice_number": "Número de factura",
+        "concept": "Concepto", "refunded_on": "Fecha de devolución",
+        "deposit_amount": "Depósito original (USD)", "deduction": "Descuento (USD)",
+        "deduction_reason": "Motivo del descuento", "keys_returned": "Llaves entregadas",
+        "inspection_ok": "Revisión sin novedad", "receipt_number": "Número de recibo",
+    }
+
+    def payment_details(payment) -> None:
+        st.table([{
+            labels.get(field, field): value if value is not None and value != "" else "Sin indicar"
+            for field, value in payment.items()
+            if field not in ("receipt_pdf", "id", "resident_id")
+        }])
+
+    st.subheader({1: "Residentes Activas", 2: "Pagos Pendientes", 3: "Residentes de Baja"}[view])
+    st.caption("Solo consulta y descarga. No se permiten cambios en los registros.")
+    search = st.text_input("Buscar por nombre o cédula", key=f"readonly_search_{tab_index}_{view}").strip().casefold()
+    residents = store.list_residents(tab_index, inactive=view == 3)
+    today = date.today()
+    shown = 0
+    for resident in residents:
+        if view == 2 and (resident.next_payment - today).days > ALERT_DAYS:
+            continue
+        if search and not any(search in resident.values[field].casefold() for field in ("student_name", "student_id")):
+            continue
+        shown += 1
+        label = f"{resident.values['student_name']} — {resident.values['student_id']}"
+        if view != 3 and (resident.next_payment - today).days <= ALERT_DAYS:
+            label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            label = f":red[{label} — {payment_status(resident.next_payment, today)} ({resident.next_payment:%d/%m/%Y})]"
+        with st.expander(label):
+            st.table([{"Dato": label, "Valor": resident.values.get(field) or "Sin indicar"} for field, label in PERSONAL_FIELDS.items()])
+            st.table([{"Recaudo": label, "Consignado": "Sí" if checked else "No"} for label, checked in zip(DOCUMENT_LABELS, resident.documents)])
+            st.write(f"Próximo cobro: {resident.next_payment:%d/%m/%Y} — {payment_status(resident.next_payment, today)}")
+            if resident.discharged_on:
+                st.write(f"Baja: {resident.discharged_on:%d/%m/%Y}. Motivo: {resident.discharge_reason}")
+            key = f"readonly_{tab_index}_{resident.id}"
+            st.download_button(
+                "Descargar planilla completada (PDF)", store.get_pdf(resident.id, tab_index),
+                file_name=f"Planilla_Ingreso_{resident.id}.pdf", mime="application/pdf", key=f"{key}_admission",
+            )
+            deposit = store.deposit_details(resident.id, tab_index)
+            if deposit:
+                st.markdown("**Pago de depósito**")
+                payment_details(deposit)
+                receipt = store.get_deposit_receipt(resident.id, tab_index)
+                if receipt:
+                    st.download_button("Descargar recibo de depósito (PDF)", receipt, file_name=f"Deposito_{resident.id}.pdf", mime="application/pdf", key=f"{key}_deposit")
+            for item in store.payment_history(resident.id, tab_index):
+                st.markdown("**Pago de mensualidad**")
+                payment_details(item)
+                due = date.fromisoformat(item["due_date"])
+                receipt = store.get_payment_receipt(resident.id, tab_index, due)
+                if receipt:
+                    st.download_button(f"Descargar recibo de mensualidad — {due:%d/%m/%Y} (PDF)", receipt, file_name=f"Mensualidad_{resident.id}_{due}.pdf", mime="application/pdf", key=f"{key}_{due}")
+            for service in store.service_payment_history(resident.id, tab_index):
+                st.markdown("**Pago por otros Servicios**")
+                payment_details({field: service[field] for field in (
+                    "concept", "paid_on", "currency", "amount", "payment_method",
+                    "exchange_rate", "exchange_rate_date", "receiving_bank", "invoice_number",
+                )})
+                st.download_button(
+                    f"Descargar recibo de servicio — {service['concept']} (PDF)",
+                    bytes(service["receipt_pdf"]), file_name=f"Servicio_{service['id']}.pdf",
+                    mime="application/pdf", key=f"{key}_service_{service['id']}",
+                )
+            refund = store.deposit_refund(resident.id, tab_index)
+            if refund:
+                st.markdown("**Constancia de entrega de depósito**")
+                payment_details(refund)
+                st.download_button("Descargar constancia de entrega de depósito (PDF)", refund["receipt_pdf"], file_name=f"Entrega_{resident.id}.pdf", mime="application/pdf", key=f"{key}_refund")
+    if not shown:
+        st.info("No hay residentes que mostrar en esta vista.")
 
 
 def _render_service_payment(
@@ -1614,7 +1732,7 @@ def _render_residents(
 
 
 st.set_page_config(
-    page_title="Portal Administrativo Control y Administración",
+    page_title="Portal de Administración y Control",
     page_icon="🏛️",
     layout="wide",
 )
@@ -1781,17 +1899,15 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+st.markdown(f"**{escape(st.session_state.get('portal_username', ''))}**")
+
 st.markdown(
     """
     <div class="prototype-note">
         <strong></strong>
     </div>
-    <div class="masthead">
-        <div class="brand">
-        </div>
-    </div>
     <section class="hero">
-        <div class="eyebrow">Portal Administrativo Control y Administración</div>
+        <div class="eyebrow">Portal de Administración y Control</div>
         <h1>RESIDENCIA ESTUDIANTIL</h1>
         <p>
         </p>
@@ -1800,8 +1916,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+access = require_login()
+residence_areas = select_residence_area(access)
+
 try:
     resident_store = ResidentStore()
+    resident_store.authorize_write = access.require_write
+    render_user_management(access)
+except PermissionError as error:
+    st.error(str(error))
+    st.stop()
 except (sqlite3.Error, OSError):
     LOGGER.exception("Error al abrir la base de datos de residentes")
     st.error(
@@ -1810,9 +1934,9 @@ except (sqlite3.Error, OSError):
     )
     st.stop()
 
-tabs = st.tabs(["Residencia Carmen Luisa", "Residencia las Acacias"])
+tabs = st.tabs([RESIDENCE_NAMES[index] for index in residence_areas])
 
-for tab_index, tab in enumerate(tabs):
+for tab_index, tab in zip(residence_areas, tabs):
     with tab:
         columns = st.columns(5)
         for card_index, (column, label) in enumerate(zip(
@@ -1823,19 +1947,28 @@ for tab_index, tab in enumerate(tabs):
             ],
         )):
             with column:
+                if card_index == 0 and not access.can_write:
+                    continue
                 if st.button(label, key=f"residencia_action_{tab_index}_{card_index}"):
                     st.session_state[f"residence_view_{tab_index}"] = card_index
-        view = st.session_state.get(f"residence_view_{tab_index}", 0)
+        view = st.session_state.get(f"residence_view_{tab_index}", 0 if access.can_write else 1)
         try:
             if view == 0:
+                access.require_write()
                 _render_admission_form(tab_index, resident_store)
             elif view == 4:
-                _render_monthly_received(tab_index, resident_store)
+                _render_monthly_received(tab_index, resident_store, can_write=access.can_write)
             elif view in (1, 2, 3):
-                _render_residents(
-                    tab_index, resident_store, pending_only=view == 2,
-                    inactive=view == 3,
-                )
+                if access.can_write:
+                    _render_residents(
+                        tab_index, resident_store, pending_only=view == 2,
+                        inactive=view == 3,
+                    )
+                else:
+                    _render_readonly_residents(tab_index, resident_store, view)
+        except PermissionError as error:
+            st.error(str(error))
+            st.stop()
         except (sqlite3.Error, OSError):
             LOGGER.exception("Error de almacenamiento en la vista de residentes")
             st.error(

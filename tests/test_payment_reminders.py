@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
@@ -19,6 +20,14 @@ from resident_store import ResidentStore
 
 class PaymentReminderTests(unittest.TestCase):
     def setUp(self):
+        login = patch("portal_auth.require_login", return_value=SimpleNamespace(
+            role="administrator", can_write=True, require_write=lambda: None,
+        ))
+        login.start()
+        self.addCleanup(login.stop)
+        area = patch("portal_auth.select_residence_area", return_value=(0, 1))
+        area.start()
+        self.addCleanup(area.stop)
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.store = ResidentStore(Path(directory.name) / "test.sqlite3")

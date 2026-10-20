@@ -10,9 +10,87 @@ python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
+## Inicio de sesión y perfiles
+
+El portal siempre exige autenticación antes de mostrar residentes, pagos o
+descargas. No tiene usuarios ni contraseñas predeterminados ni modo público.
+La primera vez, establece la contraseña directamente en el portal mediante
+**Nueva contraseña** y **Confirmar contraseña**, sin código de activación.
+**Completa esta configuración en un entorno privado antes de publicar el
+portal**: mientras no exista la cuenta inicial, cualquier persona con acceso
+a esa pantalla podría crearla y acceder a los datos.
+Solo se permite crear una cuenta inicial, incluso ante envíos simultáneos.
+No escribas contraseñas en el código, GitHub ni el chat.
+El usuario queda fijado como **Programador**
+(el inicio de sesión no distingue mayúsculas/minúsculas).
+La contraseña elegida es permanente hasta que decidas cambiarla o recuperarla;
+no requiere cambio en el primer acceso. La pantalla inicial desaparece al
+activar la cuenta y no permite reemplazar su contraseña desde esa pantalla.
+También está disponible `python portal_auth.py bootstrap` en una terminal
+privada, antes de iniciar el servidor, para crear la cuenta sin exponer el
+formulario inicial en internet.
+
+| Perfil | Máximo de cuentas | Permisos |
+| --- | --- | --- |
+| ADMINISTRADOR PROGRAMADOR | 1 | Todas las operaciones y administración de usuarios |
+| ADMINISTRADOR | 1 | Ingresos, pagos, facturas, saldos iniciales y bajas; sin administrar usuarios |
+| USUARIO VISUALIZAR | 2 | Consulta de ambas residencias y descarga de planillas, recibos y reportes; sin modificar datos |
+
+El programador usa **Administración de usuarios** para crear las otras tres
+cuentas, activar/desactivar su acceso y restablecer contraseñas temporales.
+Las cuentas inactivas también ocupan su cupo: se reutiliza la cuenta existente
+en lugar de crear otra. No se puede crear otro programador desde el portal ni
+desactivar su propia cuenta. Todos acceden a ambas residencias.
+El **ADMINISTRADOR** debe elegir **Residencia Carmen Luisa** o
+**Residencia Las Acacias** después de autenticarse y cambiar su contraseña
+temporal, y pulsar el botón principal **Ingresar al área** antes de consultar
+registros.
+Solo se muestra y se procesa el área elegida. **Cambiar de área**, en la barra
+lateral, vuelve a la selección sin cerrar sesión y limpia formularios, búsquedas
+y borradores de la sesión para evitar mezclar las áreas. Al cerrar sesión debe
+elegir nuevamente.
+El programador y los usuarios de consulta mantienen ambas residencias visibles.
+El nombre de la cuenta autenticada se muestra en la cabecera superior del portal.
+
+Las contraseñas tienen entre 12 y 128 caracteres y se guardan mediante
+**scrypt con una sal aleatoria por contraseña**, nunca en texto claro.
+Entrega las contraseñas temporales por un canal privado: cada usuario debe
+cambiarlas al entrar antes de poder consultar datos. Todos pueden cambiar su
+propia contraseña desde la barra lateral. Si el programador pierde la suya,
+el responsable del servidor puede ejecutar
+`python portal_auth.py recover-programmer` en su terminal privada.
+
+Después de cinco intentos fallidos, la cuenta se bloquea durante 15 minutos.
+Las sesiones vencen a los 30 minutos sin interacción o a las ocho horas de
+iniciadas. Cerrar sesión, cambiar/restablecer contraseña o desactivar la cuenta
+revoca las sesiones correspondientes. Al recargar completamente el navegador
+o reiniciar el portal puede ser necesario entrar nuevamente. Los permisos se
+verifican en el servidor: ocultar botones no es la única protección.
+
+### Preparación del servidor de producción
+
+- Publica solo detrás de **HTTPS**, con WebSocket habilitado para Streamlit.
+  No expongas el puerto de desarrollo ni la carpeta de datos como archivos web.
+- Configura `RESIDENCIAS_DATA_DIR` con la ruta absoluta de un **disco persistente
+  privado**, antes de iniciar el portal, el comando de cuentas y los recordatorios.
+  Sin esa variable se utiliza `data/` junto al proyecto.
+- El almacenamiento contiene `residencias.sqlite3` (registros, fotos, PDFs y
+  pagos) y `auth.sqlite3` (cuentas, hashes y sesiones). Ambos quedan fuera de Git.
+  Traslada los datos existentes de forma privada, con los procesos detenidos,
+  antes de configurar la ruta nueva. No crees una base vacía por error al cambiarla.
+- Respalda ambas bases con la API de copia de seguridad de SQLite o con los
+  procesos detenidos. Guarda copias cifradas fuera del servidor y verifica su
+  restauración. No publiques respaldos en GitHub. **La autenticación no configura
+  automáticamente un servidor, dominio, HTTPS ni respaldos programados.**
+- Conserva las credenciales SMTP en el gestor de secretos del alojamiento;
+  no en archivos versionados. `.env` y `.streamlit/secrets.toml` están excluidos.
+- El proceso independiente de recordatorios necesita acceso local confiable al
+  disco y al secreto SMTP; no necesita iniciar sesión como un usuario del portal.
+  Protege también el acceso a la terminal y los permisos del directorio.
+
 ## Ingresos y residentes
 
-1. El formulario de **Nuevo Ingreso** se muestra desplegado al abrir cada
+1. Tras iniciar sesión con permisos de administración, el formulario de **Nuevo Ingreso** se muestra desplegado al abrir cada
    residencia. Selecciona las fechas de nacimiento e ingreso con sus
    calendarios (formato `DD/MM/AAAA`). La edad se calcula al cambiar el nacimiento,
    según la fecha actual y si ya cumplió años, como `47 AÑOS`; no se edita
@@ -254,11 +332,18 @@ python -m streamlit run app.py
    iniciales no se presentan como pagos de residentes ni se suman dos veces.
    **Descargar lista de pagos del mes (PDF)** entrega la misma lista y resumen,
    con identificación fiscal de la residencia, mes, advertencias y páginas numeradas.
+   Usa **Mes del informe** para volver a generar una lista de cualquier mes con
+   pagos registrados, incluidos los informes creados antes de las correcciones.
+   Descarga el PDF nuevo para reemplazar en tus archivos la copia anterior.
    Se imprime en hojas carta horizontales; las listas largas usan varias páginas.
    Cada fila se mantiene completa en una hoja, con encabezados repetidos cuando
    una tabla continúa. Los títulos de resumen acompañan sus datos. Se reservan
    márgenes de impresión y espacio exclusivo para la firma del administrador
    en la última página, sin superponerla a tablas ni al pie de página.
+   La tabla usa líneas verticales continuas y uniformes, sin remarcar las
+   divisiones entre Fecha/Residente, Bolívares/IVA y Tasa BCV/Fecha de la tasa.
+   Los PDFs descargados anteriormente deben descargarse de nuevo desde el portal
+   para ver el diseño corregido.
    Si una fila excepcionalmente larga no cabe completa en una hoja, se informa
    el error en lugar de generar un PDF con datos cortados.
    En **Ingresar o corregir números de factura** se escribe y guarda manualmente
@@ -266,6 +351,11 @@ python -m streamlit run app.py
    La columna **N.º de factura** aparece en pantalla y en el PDF. Es independiente
    de la numeración automática del recibo; admite hasta 40 caracteres, conserva
    ceros iniciales y permite correcciones o dejarlo vacío para quitarlo.
+   En la columna **Residente**, cada nombre ocupa como máximo dos líneas:
+   primer nombre e inicial del segundo en la primera; primer apellido e inicial
+   del segundo apellido en la segunda. El nombre completo permanece guardado.
+   Los datos de **Habitación**, **Cama** y **N.º de factura** aparecen centrados
+   en la tabla y en el PDF.
    Los pagos sin factura guardada muestran «Sin indicar». Los montos y recibos no cambian.
    Cada página indica «Fecha de impresión» con la fecha de generación de la descarga
    (no la fecha de impresión física). La última página reserva una línea para la

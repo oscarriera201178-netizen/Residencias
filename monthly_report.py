@@ -7,6 +7,9 @@ import pymupdf
 from resident_format import format_identity
 
 
+CENTERED_COLUMNS = {"Habitación", "Cama", "N.º de factura"}
+
+
 def generate_monthly_report(
     residence: int,
     month: date,
@@ -17,12 +20,35 @@ def generate_monthly_report(
     bank_summary: list[dict[str, str]] | None = None,
     dollar_summary: list[dict[str, str]] | None = None,
 ) -> bytes:
+    def cell(tag: str, label: str, value: str) -> str:
+        if tag == "th" and label.casefold() == "cédula de identidad":
+            value = "Cédula de Identidad"
+        formatted = (
+            format_identity(value)
+            if tag == "td" and "cédula" in label.casefold()
+            else value
+        )
+        content = (
+            "<br>".join(escape(line) for line in formatted.splitlines())
+            if tag == "td" and label == "Residente"
+            else escape(formatted)
+        )
+        css_classes = []
+        if label in CENTERED_COLUMNS:
+            css_classes.append("centered")
+        if label == "Residente":
+            css_classes.append("resident-divider")
+        elif label.casefold() == "cédula de identidad":
+            css_classes.append("identity-divider")
+        css_class = f' class="{" ".join(css_classes)}"' if css_classes else ""
+        return f"<{tag}{css_class}>{content}</{tag}>"
+
     def table(rows: list[dict[str, str]]) -> str:
         headers = list(rows[0])
-        head = "".join(f"<th>{escape(label)}</th>" for label in headers)
+        head = "".join(cell("th", label, label) for label in headers)
         body = "".join(
             "<tr>" + "".join(
-                f"<td>{escape(format_identity(row[label]) if 'cédula' in label.casefold() else row[label])}</td>"
+                cell("td", label, row[label])
                 for label in headers
             ) + "</tr>"
             for row in rows
@@ -33,6 +59,9 @@ def generate_monthly_report(
         "body { font-family: sans-serif; font-size: 8pt; }"
         "table { width: 100%; border-collapse: collapse; margin-bottom: 12pt; }"
         "th, td { border: 0.5pt solid #777; padding: 4pt; }"
+        "th.centered, td.centered { text-align: center; }"
+        "th.resident-divider, td.resident-divider { border-right: 0.5pt solid #777; }"
+        "th.identity-divider, td.identity-divider { border-left: 0.5pt solid #777; }"
         "th { background-color: #eee; font-weight: bold; }"
     )
     output = BytesIO()

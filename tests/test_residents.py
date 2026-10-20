@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pymupdf
@@ -21,6 +22,7 @@ from resident_store import (
     ResidentStore, bolivars_from_dollars, calculate_age,
     normalize_admission_values, payment_status,
 )
+from resident_format import format_resident_display_name
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
@@ -517,6 +519,82 @@ class StoreTests(unittest.TestCase):
                 document[0].apply_redactions()
             self.assertEqual(a[0].get_text(), b[0].get_text())
             self.assertEqual(a[0].get_pixmap().samples, b[0].get_pixmap().samples)
+
+    def test_monthly_report_uses_uniform_thin_table_lines(self):
+        entries = [{
+            "Fecha": f"{day:02d}/10/2026", "Residente": f"ESTUDIANTE PRUEBA {day}",
+            "Cédula de identidad": f"V-1234567{day}",
+            "Habitación": f"HAB-{day}", "Cama": f"CAMA-{day}",
+            "Tipo de pago": "Mensualidad", "N.º de factura": f"FACT-{day}",
+            "Bolívares (Bs.)": "1.234,00", "IVA (16%) (Bs.)": "170,21",
+            "Tasa BCV (Bs./USD)": "450,1234", "Fecha de la tasa": "20/10/2026",
+            "Banco receptor": "Banco de Venezuela", "Dólares (USD)": "—",
+            "Forma de pago USD": "—",
+        } for day in range(18, 21)]
+        pdf = generate_monthly_report(0, date.today(), entries, [{"Total": "1"}])
+        with pymupdf.open(stream=pdf, filetype="pdf") as document:
+            page = document[0]
+            text = " ".join(page.get_text().split())
+            for heading in (
+                "Fecha", "Residente", "Bolívares (Bs.)", "IVA (16%) (Bs.)",
+                "Tasa BCV (Bs./USD)", "Fecha de la tasa",
+            ):
+                self.assertIn(" ".join(heading.split()), text)
+            self.assertIn("Cédula de Identidad", text)
+            self.assertNotIn("CÉDULA DE IDENTIDAD", text)
+            for value in ("HAB-18", "CAMA-18", "FACT-18"):
+                text_rect = page.search_for(value)[0]
+                self.assertLess(
+                    abs(text_rect.x0 + text_rect.width / 2 - 396),
+                    396,
+                )
+            vertical_grid_lines = [
+                drawing["rect"] for drawing in page.get_drawings()
+                if 0 < drawing["rect"].width <= 0.6
+                and drawing["rect"].height > 15
+                and drawing["rect"].y0 < 150
+            ]
+            self.assertTrue(vertical_grid_lines)
+            self.assertTrue(all(line.width == 0.5 for line in vertical_grid_lines))
+            column_edges = sorted({
+                round(line.x0, 2)
+                for line in vertical_grid_lines
+                if line.y0 < 121
+            })
+            resident_identity_boundary = column_edges[2]
+            dividing_segments = sorted(
+                (
+                    line for line in vertical_grid_lines
+                    if abs(line.x0 - resident_identity_boundary) < 0.1
+                ),
+                key=lambda line: line.y0,
+            )
+            self.assertTrue(dividing_segments)
+            self.assertLessEqual(dividing_segments[0].y0, 120)
+            self.assertGreaterEqual(dividing_segments[-1].y1, 150)
+            for previous, following in zip(dividing_segments, dividing_segments[1:]):
+                self.assertLessEqual(following.y0, previous.y1 + 0.1)
+            for value, column_index in (
+                ("HAB-18", 3), ("CAMA-18", 4), ("FACT-18", 6),
+            ):
+                cell = page.search_for(value)[0]
+                column_center = (column_edges[column_index] + column_edges[column_index + 1]) / 2
+                text_center = (cell.x0 + cell.x1) / 2
+                self.assertAlmostEqual(text_center, column_center, delta=1)
+
+    def test_monthly_report_resident_name_uses_given_and_surname_initials(self):
+        self.assertEqual(
+            format_resident_display_name("MARÍA CAROLINA PÉREZ GÓMEZ"),
+            "MARÍA C.\nPÉREZ G.",
+        )
+        self.assertEqual(
+            format_resident_display_name("MARÍA CAROLINA PÉREZ"),
+            "MARÍA C.\nPÉREZ",
+        )
+        self.assertEqual(
+            format_resident_display_name("MARÍA PÉREZ"),
+            "MARÍA\nPÉREZ",
+        )
 
     def test_discharge_history_lists_newest_admission_first_for_same_student(self):
         ids = []
@@ -1838,6 +1916,93 @@ class StoreTests(unittest.TestCase):
 
 
 class AppTests(unittest.TestCase):
+    def test_monthly_report_can_be_regenerated_for_a_previous_month(self):
+        today = date.today()
+        previous_month = today.replace(day=1) - timedelta(days=1)
+        report_month = previous_month.replace(day=1)
+        values = admission_values("01/01/2025")
+        values["student_name"] = "MARÍA CAROLINA PÉREZ GÓMEZ"
+        resident_id = self.store.add(
+            0, values, [False] * 8, b"%PDF-test", None,
+        )
+        self.store.record_deposit(
+            resident_id, 0, previous_month, "Zelle", Decimal("150"),
+        )
+
+        with patch(
+            "monthly_report.generate_monthly_report",
+            wraps=generate_monthly_report,
+        ) as report:
+            app = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+            app.button(key="residencia_action_0_4").click().run()
+            self.assertFalse(app.exception)
+            app.selectbox(key="monthly_received_month_0").select(
+                previous_month.strftime("%m/%Y")
+            ).run()
+            self.assertFalse(app.exception)
+            self.assertEqual(
+                list(app.tabs[0].table[0].value["Residente"]),
+                ["MARÍA C.\nPÉREZ G.", "TOTAL"],
+            )
+
+            self.assertTrue(report.called)
+            call = next(c for c in report.call_args_list if c.args[1] == report_month)
+            with pymupdf.open(
+                stream=generate_monthly_report(*call.args, **call.kwargs),
+                filetype="pdf",
+            ) as document:
+                text = " ".join(" ".join(page.get_text().split()) for page in document)
+                self.assertIn("MARÍA C. PÉREZ G.", text)
+                self.assertNotIn("MARÍA CAROLINA PÉREZ GÓMEZ", text)
+                self.assertIn("MARÍA C.\nPÉREZ G.", document[0].get_text())
+                self.assertIn(
+                    f"PAGOS RECIBIDOS EN EL MES - {report_month:%m/%Y}",
+                    text,
+                )
+
+    def test_monthly_report_abbreviates_every_resident_name(self):
+        full_names = (
+            "MARÍA CAROLINA PÉREZ GÓMEZ",
+            "ANA LUCÍA RIVAS TORRES",
+            "JOSÉ MIGUEL DÍAZ ROJAS",
+        )
+        for index, full_name in enumerate(full_names):
+            values = admission_values(date.today().strftime("%d/%m/%Y"))
+            values.update(
+                student_name=full_name,
+                student_id=f"V-1234567{index}",
+            )
+            resident_id = self.store.add(
+                0, values, [False] * 8, b"%PDF-test", None,
+            )
+            self.store.record_deposit(
+                resident_id, 0, date.today(), "Zelle", Decimal("150"),
+            )
+
+        with patch(
+            "monthly_report.generate_monthly_report",
+            wraps=generate_monthly_report,
+        ) as report:
+            app = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
+            app.button(key="residencia_action_0_4").click().run()
+            self.assertFalse(app.exception)
+            names = list(app.tabs[0].table[0].value["Residente"][:-1])
+            expected_names = [
+                format_resident_display_name(name) for name in full_names
+            ]
+            self.assertEqual(names, expected_names)
+
+            call = next(c for c in report.call_args_list if c.args[0] == 0)
+            with pymupdf.open(
+                stream=generate_monthly_report(*call.args, **call.kwargs),
+                filetype="pdf",
+            ) as document:
+                text = " ".join(" ".join(page.get_text().split()) for page in document)
+                for full_name, expected_name in zip(full_names, expected_names):
+                    self.assertIn(" ".join(expected_name.split()), text)
+                    self.assertNotIn(full_name, text)
+                self.assertIn("MARÍA C.\nPÉREZ G.", document[0].get_text())
+
     def test_new_admission_blocks_missing_assignment_before_pdf_generation(self):
         for residence in (0, 1):
             for room, bed, expected in (
@@ -1877,8 +2042,10 @@ class AppTests(unittest.TestCase):
     def test_service_payment_form_receipts_and_monthly_report_for_both_residences(self):
         today = date.today()
         for residence in (0, 1):
+            values = admission_values(today.strftime("%d/%m/%Y"))
+            values["student_name"] = "MARÍA CAROLINA PÉREZ GÓMEZ"
             resident_id = self.store.add(
-                residence, admission_values(today.strftime("%d/%m/%Y")), [False] * 8, b"%PDF-test", None,
+                residence, values, [False] * 8, b"%PDF-test", None,
             )
             due = self.store.list_residents(residence)[0].next_payment
             key = f"resident_{residence}_{resident_id}_False_False"
@@ -1930,6 +2097,10 @@ class AppTests(unittest.TestCase):
                 tab = app.tabs[residence]
                 collection = tab.table[0].value
                 self.assertEqual(
+                    list(collection["Residente"][:-1]),
+                    ["MARÍA C.\nPÉREZ G."] * 3,
+                )
+                self.assertEqual(
                     list(collection["IVA (16%) (Bs.)"]),
                     ["20.801,60", "—", "20.801,60", "41.603,20"],
                 )
@@ -1951,6 +2122,9 @@ class AppTests(unittest.TestCase):
                     text = " ".join(" ".join(p.get_text().split()) for p in document)
                     for concept in SERVICE_CONCEPTS:
                         self.assertIn(f"Otros servicios: {concept}", text)
+                    self.assertIn("MARÍA C. PÉREZ G.", text)
+                    self.assertIn("MARÍA C.\nPÉREZ G.", document[0].get_text())
+                    self.assertNotIn("MARÍA CAROLINA PÉREZ GÓMEZ", text)
                     self.assertIn("41.603,20", text)
                 invoice_key = f"invoice_{residence}_Otros servicios: De Nevera_"
                 invoice = next(i for i in tab.text_input if i.key.startswith(invoice_key))
@@ -2139,7 +2313,7 @@ class AppTests(unittest.TestCase):
                 bolivar_row = next(
                     row for row in collection_rows if row["Bolívares (Bs.)"] == "10,01"
                 )
-                self.assertEqual(bolivar_row["Residente"], "RESIDENTE FICTICIA")
+                self.assertEqual(bolivar_row["Residente"], "RESIDENTE\nFICTICIA")
                 self.assertEqual(bolivar_row["Cédula de identidad"], "V- 12.345.678")
                 self.assertEqual(bolivar_row["Habitación"], "1")
                 self.assertEqual(bolivar_row["Cama"], "2")
@@ -2542,7 +2716,7 @@ class AppTests(unittest.TestCase):
         rows = rows.iloc[:-1]
         self.assertIn("Banco del Tesoro", list(rows["Banco receptor"]))
         self.assertEqual(set(rows["Tipo de pago"]), {"Mensualidad", "Depósito de ingreso"})
-        self.assertIn("RESIDENTE FICTICIA", list(rows["Residente"]))
+        self.assertIn("RESIDENTE\nFICTICIA", list(rows["Residente"]))
         self.assertEqual(set(rows["Habitación"]), {"1"})
         self.assertEqual(set(rows["Cama"]), {"2"})
         totals = tab.table[1].value
@@ -2902,6 +3076,14 @@ class AppTests(unittest.TestCase):
         self.mock_store = patch("resident_store.ResidentStore", return_value=self.store)
         self.mock_store.start()
         self.addCleanup(self.mock_store.stop)
+        login = patch("portal_auth.require_login", return_value=SimpleNamespace(
+            role="administrator", can_write=True, require_write=lambda: None,
+        ))
+        login.start()
+        self.addCleanup(login.stop)
+        area = patch("portal_auth.select_residence_area", return_value=(0, 1))
+        area.start()
+        self.addCleanup(area.stop)
 
     def open_form(self):
         app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
