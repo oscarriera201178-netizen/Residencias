@@ -8,7 +8,10 @@ from unittest import mock
 import libsql
 
 import db
-from portal_auth import AuthStore, seed_from_secrets
+from portal_auth import (
+    AUTH_COOKIE, AuthStore, _delete_auth_cookie, _read_auth_cookie, _set_auth_cookie,
+    seed_from_secrets,
+)
 
 
 PASSWORD = "contraseña-larga-1"
@@ -115,6 +118,36 @@ class SeedFromSecretsTest(unittest.TestCase):
                 config = _seed_config()
         self.assertEqual(config["programmer_password"], PASSWORD)
         self.assertEqual(config["administrator_password"], ADMIN_PASSWORD)
+
+
+class AuthCookieTest(unittest.TestCase):
+    def test_read_cookie_returns_token(self):
+        with mock.patch("portal_auth.st") as mock_st:
+            mock_st.context.cookies.get.return_value = "token-abc"
+            self.assertEqual(_read_auth_cookie(), "token-abc")
+
+    def test_read_cookie_without_context_or_value(self):
+        with mock.patch("portal_auth.st") as mock_st:
+            mock_st.context.cookies.get.side_effect = Exception("sin contexto")
+            self.assertEqual(_read_auth_cookie(), "")
+        with mock.patch("portal_auth.st") as mock_st:
+            mock_st.context.cookies.get.return_value = None
+            self.assertEqual(_read_auth_cookie(), "")
+
+    def test_set_cookie_script(self):
+        with mock.patch("portal_auth.components") as mock_components:
+            _set_auth_cookie("token-abc")
+        script = mock_components.html.call_args.args[0]
+        self.assertIn(f"{AUTH_COOKIE}=token-abc", script)
+        self.assertIn("Max-Age=28800", script)
+        self.assertIn("SameSite=Strict", script)
+
+    def test_delete_cookie_script(self):
+        with mock.patch("portal_auth.components") as mock_components:
+            _delete_auth_cookie()
+        script = mock_components.html.call_args.args[0]
+        self.assertIn(f"{AUTH_COOKIE}=;", script)
+        self.assertIn("Max-Age=0", script)
 
 
 if __name__ == "__main__":

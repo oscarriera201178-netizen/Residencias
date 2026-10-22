@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 import db
 
@@ -26,6 +27,7 @@ ROLES = {
 LIMITS = {"programmer": 1, "administrator": 1, "viewer": 2}
 IDLE_SECONDS = 30 * 60
 SESSION_SECONDS = 8 * 60 * 60
+AUTH_COOKIE = "residencias_auth"
 RESIDENCE_NAMES = ("Residencia Carmen Luisa", "Residencia Las Acacias")
 
 
@@ -316,6 +318,36 @@ def seed_from_secrets(store: "AuthStore", config: dict | None = None) -> bool:
     return True
 
 
+def _cookie_script(body: str) -> None:
+    components.html(f"<script>{body}</script>", height=0)
+
+
+def _read_auth_cookie() -> str:
+    """Token guardado en el navegador para mantener la sesión al refrescar."""
+    try:
+        token = st.context.cookies.get(AUTH_COOKIE, "")
+    except Exception:  # contexto no disponible (por ejemplo en pruebas)
+        return ""
+    return token if type(token) is str else ""
+
+
+def _set_auth_cookie(token: str) -> None:
+    _cookie_script(
+        "const secure = (location.protocol === 'https:' || location.hostname === 'localhost')"
+        " ? '; Secure' : '';"
+        f"document.cookie = '{AUTH_COOKIE}={token}; Path=/; Max-Age={SESSION_SECONDS};"
+        " SameSite=Strict' + secure;"
+    )
+
+
+def _delete_auth_cookie() -> None:
+    _cookie_script(
+        "const secure = (location.protocol === 'https:' || location.hostname === 'localhost')"
+        " ? '; Secure' : '';"
+        f"document.cookie = '{AUTH_COOKIE}=; Path=/; Max-Age=0; SameSite=Strict' + secure;"
+    )
+
+
 def require_login() -> Access:
     try:
         store = AuthStore()
@@ -349,13 +381,20 @@ def require_login() -> Access:
                         st.rerun()
             st.stop()
         token = st.session_state.get("auth_token", "")
+        from_cookie = False
+        if not token:
+            token = _read_auth_cookie()
+            from_cookie = bool(token)
         user = None
         if token:
             try:
                 user = store.validate(token)
             except PermissionError as error:
                 st.session_state.clear()
-                st.warning(str(error))
+                if from_cookie:
+                    _delete_auth_cookie()
+                else:
+                    st.warning(str(error))
         if user is None:
             st.subheader("Iniciar sesión")
             with st.form("login", clear_on_submit=True):
@@ -370,6 +409,7 @@ def require_login() -> Access:
                 else:
                     st.session_state.clear()
                     st.session_state["auth_token"] = token
+                    _set_auth_cookie(token)
                     st.rerun()
             st.stop()
         if st.session_state.get("portal_username") != user["username"]:
@@ -378,6 +418,7 @@ def require_login() -> Access:
         st.sidebar.write(f"{user['username']} — {ROLES[user['role']]}")
         if st.sidebar.button("Cerrar sesión"):
             store.logout(token)
+            _delete_auth_cookie()
             st.session_state.clear()
             st.rerun()
         if user["must_change"]:
