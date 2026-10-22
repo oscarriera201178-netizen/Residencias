@@ -11,6 +11,7 @@ import pymupdf
 import pandas as pd
 import streamlit as st
 
+from bcv_rate import BCV_WEBSITE_URL, fetch_bcv_rate
 from deposit_receipt import SERVICE_CONCEPTS, calculate_receipt_vat, format_bolivars
 from monthly_report import generate_monthly_report
 from payment_reminders import MailConfig, VENEZUELA
@@ -42,6 +43,48 @@ DOCUMENT_LABELS = [
     "Cédula de identidad de la estudiante",
     "Constancia de trabajo de los padres o representante",
 ]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_bcv_rate():
+    try:
+        return fetch_bcv_rate(), None
+    except (OSError, ValueError) as error:
+        return None, str(error)
+
+
+def _format_exchange_rate(rate):
+    return f"{rate:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _render_bcv_ticker():
+    result, error = _cached_bcv_rate()
+    if error:
+        LOGGER.warning("No se pudo consultar la tasa oficial publicada por el BCV: %s", error)
+        st.warning(
+            "No se pudo consultar la tasa del dólar en el BCV. "
+            "Puedes volver a consultar ahora."
+        )
+        if st.button("Reintentar consulta al BCV", key="retry_bcv_rate"):
+            _cached_bcv_rate.clear()
+            st.rerun()
+        return
+    rate, published_on = result
+
+    st.markdown(
+        f"""
+        <a class="bcv-ticker" href="{BCV_WEBSITE_URL}" target="_blank"
+           rel="noopener noreferrer">
+            <span class="bcv-ticker-label">Tasa oficial del dólar · BCV</span>
+            <strong>Bs. {_format_exchange_rate(rate)} por USD</strong>
+            <span>Vigente desde {published_on:%d/%m/%Y}</span>
+            <span class="bcv-ticker-link">Consultar BCV ↗</span>
+        </a>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 PERSONAL_FIELDS = {
     "student_name": "Nombres y apellidos",
     "student_id": "Cédula de identidad",
@@ -1798,6 +1841,36 @@ st.markdown(
         font-size: 0.8rem;
         text-align: right;
     }
+    .bcv-ticker {
+        align-items: center;
+        background: #e8f1ec;
+        border: 1px solid #cbded2;
+        border-radius: 8px;
+        color: var(--navy);
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem 1.25rem;
+        justify-content: space-between;
+        margin: 0.75rem 0 1rem;
+        padding: 0.75rem 1rem;
+        text-decoration: none;
+    }
+    .bcv-ticker:hover { border-color: var(--green); }
+    .bcv-ticker-label {
+        color: var(--green);
+        font-size: 0.78rem;
+        font-weight: 700;
+        text-transform: uppercase;
+    }
+    .bcv-ticker strong { font-size: 1.05rem; }
+    .bcv-ticker > span:not(.bcv-ticker-label) {
+        color: var(--muted);
+        font-size: 0.82rem;
+    }
+    .bcv-ticker .bcv-ticker-link {
+        color: var(--green);
+        font-weight: 700;
+    }
     .hero {
         background: linear-gradient(115deg, #102b3a 0%, #174b4c 100%);
         border-radius: 12px;
@@ -1917,6 +1990,7 @@ st.markdown(
 )
 
 access = require_login()
+_render_bcv_ticker()
 residence_areas = select_residence_area(access)
 
 try:

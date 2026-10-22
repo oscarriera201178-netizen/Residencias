@@ -10,6 +10,34 @@ python -m pip install -r requirements.txt
 python -m streamlit run app.py
 ```
 
+Al guardar cambios en los archivos Python, Streamlit vuelve a ejecutar la
+aplicación automáticamente. Si el servidor ya estaba iniciado cuando se creó
+esta configuración, reinícialo una vez para que el cambio surta efecto.
+
+## Publicar una demostración en Streamlit Community Cloud
+
+1. Confirma que el código que quieres publicar está subido a GitHub en la rama
+   elegida. No subas datos privados ni secretos: `data/` y
+   `.streamlit/secrets.toml` están excluidos de Git.
+2. Entra en [Streamlit Community Cloud](https://share.streamlit.io) con GitHub,
+   autoriza el acceso al repositorio y pulsa **Create app**.
+3. Selecciona el repositorio `oscarriera201178-netizen/Residencias`, la rama
+   correspondiente y `app.py` como **Main file path**.
+4. En **Advanced settings**, elige una versión de Python compatible y configura
+   solo los secretos que realmente necesite la aplicación. Nunca guardes
+   contraseñas en el código ni en GitHub.
+5. Pulsa **Deploy** y espera a que termine la instalación de dependencias y el
+   inicio de la aplicación. Abre la URL asignada para acceder al portal.
+
+**Publicar la aplicación no configura almacenamiento persistente.** El portal
+guarda residentes, cuentas, fotos y documentos en bases SQLite locales.
+Community Cloud no garantiza que los archivos escritos por la aplicación se
+conserven tras reinicios o nuevos despliegues. Usa solo datos ficticios para
+una demostración; antes de cargar información real, adapta el almacenamiento a
+un servicio externo persistente y privado, prepara copias de seguridad y
+revisa quién puede acceder a la aplicación. No hagas pública una instancia con
+datos reales.
+
 ## Inicio de sesión y perfiles
 
 El portal siempre exige autenticación antes de mostrar residentes, pagos o
@@ -87,6 +115,17 @@ verifican en el servidor: ocultar botones no es la única protección.
 - El proceso independiente de recordatorios necesita acceso local confiable al
   disco y al secreto SMTP; no necesita iniciar sesión como un usuario del portal.
   Protege también el acceso a la terminal y los permisos del directorio.
+
+## Tasa oficial del dólar
+
+Al iniciar sesión, el cintillo del portal consulta la tasa USD publicada por el
+[Banco Central de Venezuela](https://www.bcv.org.ve/estadisticas/tipo-de-cambio-de-referencia-0)
+y muestra su fecha de vigencia. El resultado se conserva en caché durante
+cinco minutos para evitar consultas repetidas. Si el BCV no está disponible,
+el portal avisa que no pudo consultar la tasa; los pagos en bolívares siguen
+requiriendo que se registre manualmente la tasa y fecha correspondientes.
+La consulta HTTPS conserva la validación de certificados y añade el
+intermediario Sectigo R36 que el servidor del BCV omite en su cadena TLS.
 
 ## Ingresos y residentes
 
