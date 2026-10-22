@@ -8,6 +8,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable, Generator, TypedDict
 
+import db
 from deposit_receipt import (
     SERVICE_CONCEPTS, generate_deposit_receipt, generate_monthly_receipt, generate_refund_receipt,
 )
@@ -329,7 +330,7 @@ class ResidentStore:
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = db.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         try:

@@ -14,6 +14,8 @@ from pathlib import Path
 
 import streamlit as st
 
+import db
+
 
 LOGGER = logging.getLogger(__name__)
 ROLES = {
@@ -66,7 +68,7 @@ class AuthStore:
 
     @contextmanager
     def connect(self):
-        connection = sqlite3.connect(self.path, timeout=10)
+        connection = db.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         try:
@@ -268,9 +270,59 @@ def _password_form(store: AuthStore, token: str) -> None:
                 st.rerun()
 
 
+def _seed_config() -> dict:
+    """Credenciales iniciales definidas por el programador en st.secrets o el entorno."""
+    try:
+        config = dict(st.secrets.get("auth", {}))
+        if config:
+            return config
+    except Exception:  # sin Streamlit o sin secrets configurados
+        pass
+    programmer_password = os.environ.get("RESIDENCIAS_PROGRAMMER_PASSWORD", "")
+    if not programmer_password:
+        return {}
+    return {
+        "programmer_password": programmer_password,
+        "administrator_password": os.environ.get("RESIDENCIAS_ADMINISTRATOR_PASSWORD", ""),
+    }
+
+
+def seed_from_secrets(store: "AuthStore", config: dict | None = None) -> bool:
+    """Crea las cuentas iniciales desde la configuración si aún no hay programador.
+
+    Permite que el programador fije las cuentas una sola vez (Secrets de
+    Streamlit Cloud o variables de entorno) sin repetir la activación tras cada
+    reinicio del hospedaje.
+    """
+    if config is None:
+        config = _seed_config()
+    programmer_password = config.get("programmer_password", "")
+    if not programmer_password or store.initialized():
+        return False
+    programmer_username = config.get("programmer_username", "programador")
+    store.bootstrap(programmer_username, programmer_password)
+    administrator_password = config.get("administrator_password", "")
+    if administrator_password:
+        administrator_username = config.get("administrator_username", "administrador")
+        token = store.login(programmer_username, programmer_password)
+        store.create_user(token, administrator_username, administrator_password, "administrator")
+        store.logout(token)
+        with store.connect() as connection:
+            connection.execute(
+                "UPDATE users SET must_change=0 WHERE username=?",
+                (administrator_username.strip().lower(),),
+            )
+    LOGGER.info("Cuentas iniciales creadas desde la configuración del programador.")
+    return True
+
+
 def require_login() -> Access:
     try:
         store = AuthStore()
+        try:
+            seed_from_secrets(store)
+        except ValueError as error:
+            st.error(f"No se pudieron crear las cuentas configuradas: {error}")
         if not store.initialized():
             st.info(
                 "Establece y confirma la contraseña de Programador para crear la cuenta inicial."

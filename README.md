@@ -29,14 +29,49 @@ esta configuración, reinícialo una vez para que el cambio surta efecto.
 5. Pulsa **Deploy** y espera a que termine la instalación de dependencias y el
    inicio de la aplicación. Abre la URL asignada para acceder al portal.
 
-**Publicar la aplicación no configura almacenamiento persistente.** El portal
-guarda residentes, cuentas, fotos y documentos en bases SQLite locales.
+**Publicar la aplicación no configura almacenamiento persistente por defecto.**
 Community Cloud no garantiza que los archivos escritos por la aplicación se
-conserven tras reinicios o nuevos despliegues. Usa solo datos ficticios para
-una demostración; antes de cargar información real, adapta el almacenamiento a
-un servicio externo persistente y privado, prepara copias de seguridad y
-revisa quién puede acceder a la aplicación. No hagas pública una instancia con
-datos reales.
+conserven tras reinicios o nuevos despliegues, así que sin configuración
+adicional las bases SQLite locales se pierden en cada reinicio.
+
+## Persistencia en producción con Turso
+
+Para que las cuentas de usuario y la información de las residentes permanezcan
+guardadas en la nube, el portal puede sincronizar sus bases SQLite con
+[Turso](https://turso.tech) (plan gratuito). Configúralo una sola vez:
+
+1. Crea una cuenta en Turso y crea una base de datos (por ejemplo
+   `residencias`).
+2. Obtén la URL de la base (`libsql://....turso.io`) y genera un token de
+   acceso desde el panel de Turso o con la CLI: `turso db tokens create
+   residencias`.
+3. En Streamlit Community Cloud abre tu app, entra en **Settings → Secrets** y
+   pega:
+
+   ```toml
+   [turso]
+   url = "libsql://tu-base.turso.io"
+   token = "tu-token-de-acceso"
+
+   [auth]
+   programmer_password = "una-clave-larga-y-segura"
+   administrator_password = "otra-clave-larga-y-segura"
+   ```
+
+   La sección `[auth]` crea automáticamente las cuentas **Programador** y
+   **Administrador** la primera vez que arranca la aplicación; ya no tendrás
+   que activarlas tras cada reinicio. Solo quien edite estos secrets puede
+   cambiarlas. Opcionalmente puedes fijar `programmer_username` y
+   `administrator_username` (mínimo 12 caracteres las contraseñas).
+4. Guarda y pulsa **Reboot** en el menú ⋮ de la app. En el primer arranque se
+   crean las tablas y las cuentas; desde entonces todo queda guardado en Turso.
+
+Sin esas credenciales la aplicación sigue funcionando con el SQLite local
+(desarrollo y pruebas). Nunca subas los secrets al repositorio.
+
+Usa solo datos ficticios para una demostración pública; antes de cargar
+información real, prepara copias de seguridad y revisa quién puede acceder a la
+aplicación.
 
 ## Inicio de sesión y perfiles
 
