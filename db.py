@@ -22,7 +22,8 @@ from pathlib import Path
 SYNC_SECONDS = 5.0
 _last_sync: dict[str, float] = {}
 _sync_lock = threading.Lock()
-_thread_local = threading.local()
+_connections: dict[str, "_ConnectionWrapper"] = {}
+_connections_lock = threading.RLock()
 
 
 def _turso_credentials() -> tuple[str, str]:
@@ -148,48 +149,55 @@ class _ConnectionWrapper:
         self._connection.sync()
 
     def __enter__(self):
+        _connections_lock.acquire()
         self._connection.__enter__()
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        return self._connection.__exit__(exc_type, exc_value, traceback)
+        try:
+            return self._connection.__exit__(exc_type, exc_value, traceback)
+        finally:
+            _connections_lock.release()
 
 
 def _turso_connection(path: Path, url: str, token: str) -> "_ConnectionWrapper":
-    """Devuelve la conexión réplica del hilo actual, creándola una sola vez.
+    """Devuelve la conexión réplica compartida del proceso, creándola una vez.
 
     Abrir una réplica libsql cuesta más de un segundo (negociación con el
-    servidor), así que se conserva una conexión por hilo y por archivo.
+    servidor), así que se conserva una única conexión por archivo. El candado
+    serializa las transacciones de los hilos (pantallas) que la comparten.
     """
     import libsql
 
-    cache: dict[str, _ConnectionWrapper] = getattr(_thread_local, "connections", {})
-    if not cache:
-        _thread_local.connections = cache
     key = str(path)
-    wrapper = cache.get(key)
-    if wrapper is None:
-        if path.exists() and path.stat().st_size == 0:
-            path.unlink()  # un archivo vacío (touch) impide crear la réplica
-        try:
-            raw = libsql.connect(key, sync_url=url, auth_token=token, timeout=10)
-            raw.sync()
-        except Exception as error:
-            raise OSError(f"No se pudo conectar con la base de datos en la nube: {error}") from error
-        wrapper = _ConnectionWrapper(raw)
-        cache[key] = wrapper
-        with _sync_lock:
-            _last_sync[key] = time.monotonic()
-        return wrapper
+    with _connections_lock:
+        wrapper = _connections.get(key)
+        if wrapper is None:
+            if path.exists() and path.stat().st_size == 0:
+                path.unlink()  # un archivo vacío (touch) impide crear la réplica
+            try:
+                raw = libsql.connect(
+                    key, sync_url=url, auth_token=token, timeout=10,
+                    _check_same_thread=False,
+                )
+                raw.sync()
+            except Exception as error:
+                raise OSError(f"No se pudo conectar con la base de datos en la nube: {error}") from error
+            wrapper = _ConnectionWrapper(raw)
+            _connections[key] = wrapper
+            with _sync_lock:
+                _last_sync[key] = time.monotonic()
+            return wrapper
     with _sync_lock:
         due = time.monotonic() - _last_sync.get(key, 0.0) > SYNC_SECONDS
         if due:
             _last_sync[key] = time.monotonic()
     if due:
-        try:
-            wrapper.sync()
-        except Exception as error:
-            raise OSError(f"No se pudo sincronizar con la base de datos en la nube: {error}") from error
+        with _connections_lock:
+            try:
+                wrapper.sync()
+            except Exception as error:
+                raise OSError(f"No se pudo sincronizar con la base de datos en la nube: {error}") from error
     return wrapper
 
 
