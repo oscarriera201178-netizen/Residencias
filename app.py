@@ -1798,7 +1798,7 @@ st.markdown(
     }
     [data-testid="stHeader"] { background: transparent; }
     /* Ocultar los botones de Streamlit Cloud: Share, GitHub y Manage app */
-    [data-testid="stHeaderActionElements"],
+    [data-testid="stToolbar"],
     [data-testid="stAppDeployButton"],
     .stAppDeployButton { display: none !important; }
     [data-testid="stMainBlockContainer"] {
