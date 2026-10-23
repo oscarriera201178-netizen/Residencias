@@ -1797,6 +1797,10 @@ st.markdown(
         font-family: Inter, Arial, sans-serif;
     }
     [data-testid="stHeader"] { background: transparent; }
+    /* Ocultar los botones de Streamlit Cloud: Share, GitHub y Manage app */
+    [data-testid="stHeaderActionElements"],
+    [data-testid="stAppDeployButton"],
+    .stAppDeployButton { display: none !important; }
     [data-testid="stMainBlockContainer"] {
         max-width: 1180px;
         padding-top: 1.5rem;
