@@ -5,11 +5,24 @@ existen las credenciales de Turso (st.secrets["turso"] o variables de entorno
 TURSO_DATABASE_URL / TURSO_AUTH_TOKEN), se abre una réplica local sincronizada
 con la base de datos en la nube para que la información sobreviva a los
 reinicios del hospedaje.
+
+La réplica se sincroniza como máximo una vez cada SYNC_SECONDS por archivo:
+cada sincronización es un viaje de red al servidor y hacerlo en cada operación
+haría el portal extremadamente lento. Las escrituras se envían al servidor en
+el momento, por lo que nada se pierde entre sincronizaciones.
 """
 
 import os
+import re
 import sqlite3
+import threading
+import time
 from pathlib import Path
+
+SYNC_SECONDS = 5.0
+_last_sync: dict[str, float] = {}
+_sync_lock = threading.Lock()
+_thread_local = threading.local()
 
 
 def _turso_credentials() -> tuple[str, str]:
@@ -105,11 +118,21 @@ class _CursorWrapper:
 class _ConnectionWrapper:
     """Expone la misma API que sqlite3.Connection sobre una conexión libsql."""
 
+    _PRAGMA_FOREIGN_KEYS = re.compile(r"^\s*PRAGMA\s+foreign_keys\b", re.IGNORECASE)
+
     def __init__(self, connection) -> None:
         self._connection = connection
         self.row_factory = None
+        self._foreign_keys_done = False
 
     def execute(self, sql: str, parameters=()):
+        # Turso aplica las llaves foráneas en el servidor; repetir el PRAGMA en
+        # cada operación cuesta un viaje de red (~0,5 s), así que se envía una
+        # sola vez por conexión y las repeticiones se responden en local.
+        if not parameters and self._PRAGMA_FOREIGN_KEYS.match(sql):
+            if self._foreign_keys_done:
+                return _CursorWrapper(self._connection.execute("SELECT 1"), self.row_factory)
+            self._foreign_keys_done = True
         return _CursorWrapper(self._connection.execute(sql, parameters), self.row_factory)
 
     def executescript(self, script: str):
@@ -119,7 +142,7 @@ class _ConnectionWrapper:
         self._connection.commit()
 
     def close(self) -> None:
-        self._connection.close()
+        pass  # la conexión se reutiliza; cerrarla forzaría un costoso reenlace
 
     def sync(self) -> None:
         self._connection.sync()
@@ -132,6 +155,44 @@ class _ConnectionWrapper:
         return self._connection.__exit__(exc_type, exc_value, traceback)
 
 
+def _turso_connection(path: Path, url: str, token: str) -> "_ConnectionWrapper":
+    """Devuelve la conexión réplica del hilo actual, creándola una sola vez.
+
+    Abrir una réplica libsql cuesta más de un segundo (negociación con el
+    servidor), así que se conserva una conexión por hilo y por archivo.
+    """
+    import libsql
+
+    cache: dict[str, _ConnectionWrapper] = getattr(_thread_local, "connections", {})
+    if not cache:
+        _thread_local.connections = cache
+    key = str(path)
+    wrapper = cache.get(key)
+    if wrapper is None:
+        if path.exists() and path.stat().st_size == 0:
+            path.unlink()  # un archivo vacío (touch) impide crear la réplica
+        try:
+            raw = libsql.connect(key, sync_url=url, auth_token=token, timeout=10)
+            raw.sync()
+        except Exception as error:
+            raise OSError(f"No se pudo conectar con la base de datos en la nube: {error}") from error
+        wrapper = _ConnectionWrapper(raw)
+        cache[key] = wrapper
+        with _sync_lock:
+            _last_sync[key] = time.monotonic()
+        return wrapper
+    with _sync_lock:
+        due = time.monotonic() - _last_sync.get(key, 0.0) > SYNC_SECONDS
+        if due:
+            _last_sync[key] = time.monotonic()
+    if due:
+        try:
+            wrapper.sync()
+        except Exception as error:
+            raise OSError(f"No se pudo sincronizar con la base de datos en la nube: {error}") from error
+    return wrapper
+
+
 def connect(path: Path):
     """Abre la base de datos.
 
@@ -140,11 +201,5 @@ def connect(path: Path):
     """
     url, token = _turso_credentials()
     if url and token:
-        import libsql
-
-        if path.exists() and path.stat().st_size == 0:
-            path.unlink()  # un archivo vacío (touch) impide crear la réplica
-        connection = libsql.connect(str(path), sync_url=url, auth_token=token, timeout=10)
-        connection.sync()
-        return _ConnectionWrapper(connection)
+        return _turso_connection(path, url, token)
     return sqlite3.connect(path, timeout=10)
