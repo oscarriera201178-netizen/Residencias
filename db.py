@@ -87,7 +87,7 @@ class _CursorWrapper:
         return [self._convert(row) for row in self._cursor.fetchall()]
 
     def __iter__(self):
-        return (self._convert(row) for row in self._cursor)
+        return iter(self.fetchall())
 
     @property
     def lastrowid(self):
@@ -142,6 +142,8 @@ def connect(path: Path):
     if url and token:
         import libsql
 
+        if path.exists() and path.stat().st_size == 0:
+            path.unlink()  # un archivo vacío (touch) impide crear la réplica
         connection = libsql.connect(str(path), sync_url=url, auth_token=token, timeout=10)
         connection.sync()
         return _ConnectionWrapper(connection)
