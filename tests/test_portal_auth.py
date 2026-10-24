@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
-from portal_auth import AuthStore, IDLE_SECONDS, SESSION_SECONDS
+from portal_auth import (
+    AuthStore, CLIENT_SESSION_SECONDS, IDLE_SECONDS, SESSION_SECONDS,
+)
 from resident_store import ResidentStore
 
 
@@ -69,6 +71,30 @@ class AuthTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=3) as pool:
             self.assertEqual(sum(pool.map(create, range(3))), 1)
         self.assertEqual(len(self.auth.users(self.token)), 2)
+
+    def test_client_accounts_are_unlimited_and_bound_to_one_resident(self):
+        self.account("lector1")
+        self.account("lector2")
+        self.auth.create_client_user(self.token, "cliente1", TEMPORARY, 101, "key-101")
+        self.auth.create_client_user(self.token, "cliente2", TEMPORARY, 102, "key-102")
+        client = self.auth.login("cliente1", TEMPORARY)
+        self.assertEqual(self.auth.validate(client)["resident_id"], 101)
+        self.assertEqual(self.auth.validate(client)["role"], "viewer")
+        self.assertEqual(self.auth.client_resident_ids(self.token), {101, 102})
+        with self.assertRaises(ValueError):
+            self.auth.create_client_user(
+                self.token, "cliente3", TEMPORARY, 101, "different-key",
+            )
+
+    def test_client_sessions_last_up_to_30_days(self):
+        self.auth.create_client_user(self.token, "cliente", TEMPORARY, 101, "key-101")
+        with patch("portal_auth.time.time", return_value=10000):
+            token = self.auth.login("cliente", TEMPORARY)
+        with patch("portal_auth.time.time", return_value=10000 + CLIENT_SESSION_SECONDS - 1):
+            self.assertEqual(self.auth.validate(token)["resident_id"], 101)
+        with patch("portal_auth.time.time", return_value=10000 + CLIENT_SESSION_SECONDS):
+            with self.assertRaises(PermissionError):
+                self.auth.validate(token)
 
     def test_recover_programmer_revokes_sessions_without_creating_account(self):
         self.auth.recover_programmer(NEW)
