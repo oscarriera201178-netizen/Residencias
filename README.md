@@ -105,6 +105,11 @@ formulario inicial en internet.
 | ADMINISTRADOR | 1 | Ingresos, pagos, facturas, saldos iniciales y bajas; sin administrar usuarios |
 | USUARIO VISUALIZAR | 2 | Consulta de ambas residencias y descarga de planillas, recibos y reportes; sin modificar datos |
 
+También se pueden crear cuentas de cliente asociadas a una residente desde
+**Administración de usuarios**. Cada cuenta de cliente consulta únicamente la
+información y los documentos de su residente asociada; no comparte el acceso
+general del perfil de consulta ni consume el cupo de usuarios de consulta.
+
 El programador usa **Administración de usuarios** para crear las otras tres
 cuentas, activar/desactivar su acceso y restablecer contraseñas temporales.
 Las cuentas inactivas también ocupan su cupo: se reutiliza la cuenta existente
@@ -135,6 +140,45 @@ iniciadas. Cerrar sesión, cambiar/restablecer contraseña o desactivar la cuent
 revoca las sesiones correspondientes. Al recargar completamente el navegador
 o reiniciar el portal puede ser necesario entrar nuevamente. Los permisos se
 verifican en el servidor: ocultar botones no es la única protección.
+
+## Aplicación móvil de clientes para Android
+
+El portal móvil es una PWA servida por `client_api.py`; la aplicación Streamlit
+administrativa sigue ejecutándose en `app.py`. El servicio móvil sirve la
+interfaz y su API desde el mismo origen, usa una cookie `HttpOnly` y mantiene
+las sesiones de cliente hasta 30 días, con revocación al cerrar sesión,
+desactivar/restablecer su cuenta o cambiar la contraseña. El contenido privado
+no se guarda en la caché sin conexión; para consultar pagos y documentos hace
+falta conexión a internet.
+
+Para probar localmente, configura `CLIENT_COOKIE_SECURE=false` solo en el
+entorno local y ejecuta:
+
+```sh
+uvicorn client_api:app --host 127.0.0.1 --port 8000
+```
+
+En producción, publica `client_api:app` como un servicio Python independiente
+con HTTPS y configura en el alojamiento las variables `TURSO_DATABASE_URL` y
+`TURSO_AUTH_TOKEN` con las mismas credenciales de Turso del portal
+administrativo. Usa `CLIENT_COOKIE_SECURE=true` (valor predeterminado) y un
+directorio `RESIDENCIAS_DATA_DIR` escribible. Comando de inicio:
+
+```sh
+uvicorn client_api:app --host 0.0.0.0 --port $PORT
+```
+
+No publiques el servicio por HTTP ni cambies el token de Turso por uno con
+permisos más amplios de lo necesario. Tras el despliegue, abre la URL HTTPS en
+Chrome para Android y elige **Instalar app** o **Añadir a pantalla de inicio**.
+El programador crea cada cuenta desde el portal administrativo seleccionando
+la residente y entrega la contraseña temporal por un canal privado.
+
+Los avisos internos de pagos recibidos se envían a todos los clientes sin
+revelar el nombre ni el monto. Los avisos e historial de gastos muestran
+concepto, fecha, residencia, moneda y monto a todas las cuentas de clientes;
+no registres allí datos que no deban ser compartidos. Estos son avisos dentro
+de la app, no notificaciones push del sistema Android.
 
 ### Preparación del servidor de producción
 

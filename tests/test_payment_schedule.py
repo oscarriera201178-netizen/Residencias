@@ -42,6 +42,16 @@ def test_admission_then_calendar_months_without_skipping_arrears(tmp_path, admis
     assert len(store.payment_history(resident_id, residence)) == 4
     assert store.list_residents(residence)[0].next_payment == due
     assert store.list_residents(1 - residence) == []
+    notices = store.client_notifications()
+    assert len(notices) == 4
+    assert all(notice["kind"] == "payment" for notice in notices)
+    assert all(
+        notice["payload"] == {
+            "message": "Se registró un pago recibido.",
+            "residence": residence,
+        }
+        for notice in notices
+    )
 
 
 @pytest.mark.parametrize("day", range(1, 11))

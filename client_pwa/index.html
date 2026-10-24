@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="theme-color" content="#174b3a">
+    <meta name="description" content="Consulta privada de pagos y documentos de residencia.">
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/assets/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/app.css">
+    <title>Portal de clientes · Residencias</title>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Portal de clientes">
+        <img src="/assets/icon.svg" alt="">
+        <span>Residencias</span>
+      </a>
+      <button id="install-button" class="button secondary hidden" type="button">Instalar app</button>
+      <button id="logout-button" class="button secondary hidden" type="button">Cerrar sesión</button>
+    </header>
+
+    <main>
+      <section id="login-panel" class="panel auth-panel">
+        <p class="eyebrow">Portal privado</p>
+        <h1>Bienvenida</h1>
+        <p>Consulta el estado de tu cuenta, tus pagos y tus documentos.</p>
+        <form id="login-form">
+          <label for="username">Usuario</label>
+          <input id="username" name="username" autocomplete="username" required maxlength="40">
+          <label for="password">Contraseña</label>
+          <input id="password" name="password" type="password" autocomplete="current-password" required maxlength="128">
+          <button class="button primary full" type="submit">Entrar</button>
+        </form>
+        <p id="login-error" class="message error hidden" role="alert"></p>
+      </section>
+
+      <section id="password-panel" class="panel auth-panel hidden">
+        <p class="eyebrow">Primer acceso</p>
+        <h1>Cambia tu contraseña</h1>
+        <p>Por seguridad, actualiza la contraseña temporal que recibiste.</p>
+        <form id="password-form">
+          <label for="current-password">Contraseña temporal</label>
+          <input id="current-password" name="current_password" type="password" autocomplete="current-password" required maxlength="128">
+          <label for="new-password">Nueva contraseña</label>
+          <input id="new-password" name="new_password" type="password" autocomplete="new-password" required minlength="12" maxlength="128">
+          <button class="button primary full" type="submit">Guardar contraseña</button>
+        </form>
+        <p id="password-error" class="message error hidden" role="alert"></p>
+      </section>
+
+      <section id="portal-panel" class="hidden">
+        <div class="welcome">
+          <p class="eyebrow">Tu información</p>
+          <h1 id="client-name"></h1>
+          <p id="client-location" class="muted"></p>
+        </div>
+        <div id="session-message" class="message hidden" role="status"></div>
+        <nav class="nav" aria-label="Secciones">
+          <button class="nav-item active" data-section="account" type="button">Mi cuenta</button>
+          <button class="nav-item" data-section="payments" type="button">Mis pagos</button>
+          <button class="nav-item" data-section="documents" type="button">Documentos</button>
+          <button class="nav-item" data-section="notifications" type="button">Avisos</button>
+          <button class="nav-item" data-section="expenses" type="button">Gastos</button>
+        </nav>
+        <section id="section-account" class="panel content-section">
+          <h2>Estado de mi cuenta</h2>
+          <div id="account-details" class="detail-grid"></div>
+        </section>
+        <section id="section-payments" class="panel content-section hidden">
+          <h2>Mis pagos</h2>
+          <div id="payments-list" class="stack"></div>
+        </section>
+        <section id="section-documents" class="panel content-section hidden">
+          <h2>Mis documentos</h2>
+          <div id="documents-list" class="stack"></div>
+        </section>
+        <section id="section-notifications" class="panel content-section hidden">
+          <h2>Avisos de actividad</h2>
+          <p class="muted">Los avisos de pagos recibidos no muestran nombres ni montos.</p>
+          <div id="notifications-list" class="stack"></div>
+        </section>
+        <section id="section-expenses" class="panel content-section hidden">
+          <h2>Gastos registrados</h2>
+          <p class="muted">Esta información es compartida con todas las cuentas de clientes.</p>
+          <div id="expenses-list" class="stack"></div>
+        </section>
+      </section>
+    </main>
+    <footer>Residencias · Acceso privado a tu información</footer>
+    <script src="/assets/app.js" defer></script>
+  </body>
+</html>
