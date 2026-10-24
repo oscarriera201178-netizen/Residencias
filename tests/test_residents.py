@@ -23,6 +23,7 @@ from resident_store import (
     normalize_admission_values, payment_status,
 )
 from resident_format import format_resident_display_name
+from payment_schedule import next_month_start
 
 
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
@@ -740,7 +741,7 @@ class StoreTests(unittest.TestCase):
                     bank_spans = [s for s in spans if bank in s["text"] and offset <= s["bbox"][1] < 396 + offset]
                     self.assertTrue(bank_spans)
                     self.assertLess(max(s["bbox"][3] for s in bank_spans), 355 + offset)
-            due += timedelta(days=30)
+            due = next_month_start(due)
         bolivar_payment = next(
             payment for payment in self.store.received_payments(0, date.today())
             if payment["currency"] == "VES"
@@ -760,7 +761,7 @@ class StoreTests(unittest.TestCase):
             self.store.record_payment(
                 resident_id, 0, due, paid_on, "USD", Decimal(amount), payment_method="Efectivo",
             )
-            due += timedelta(days=30)
+            due = next_month_start(due)
         self.store.record_payment(
             other, 1, date(2026, 1, 1), date(2026, 1, 1), "USD",
             Decimal("999"), payment_method="Binance",
@@ -835,7 +836,7 @@ class StoreTests(unittest.TestCase):
             self.values["student_id"] = f"V-LATE-{currency}"
             resident_id = self.add_resident()
             due = date(2026, 1, 1)
-            paid_on = date(2026, 1, 4)
+            paid_on = date(2026, 1, 8)
             self.store.record_payment(
                 resident_id, 0, due, paid_on, currency,
                 Decimal("160.50") if currency == "USD" else Decimal("1621.05"),
@@ -863,7 +864,7 @@ class StoreTests(unittest.TestCase):
                     self.assertEqual(len(page.search_for(expected)), 2, expected)
                 if currency == "VES":
                     self.assertEqual(len(page.search_for("Banco receptor: Fondo Común")), 2)
-                    self.assertEqual(len(page.search_for("Monto base: USD 160.50")), 2)
+                    self.assertEqual(len(page.search_for("Monto base: USD 160,50")), 2)
                     self.assertEqual(len(page.search_for("Tasa BCV: Bs. 10,1 por USD.")), 2)
 
     def test_manual_fee_validation_and_on_time_days(self):
@@ -1168,7 +1169,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(self.store.receipt_number(other_residence, 1), "00001-2026")
             self.assertEqual(self.store.receipt_number(first, 0, due), "00001-2026")
             clock.today.return_value = date(2027, 1, 1)
-            next_due = due + timedelta(days=30)
+            next_due = next_month_start(due)
             self.store.record_payment(
                 first, 0, next_due, date(2026, 12, 31), "USD", Decimal("100"),
                 payment_method="Efectivo",
@@ -1352,7 +1353,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(restored.get_pdf(resident_id, 0), b"%PDF-test")
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
-    def test_first_monthly_payment_is_due_on_admission_and_advances_thirty_days(self):
+    def test_first_monthly_payment_is_due_on_admission_and_advances_to_next_month(self):
         for residence in (0, 1):
             resident_id = self.add_resident(residence)
             due = self.store.list_residents(residence)[0].next_payment
@@ -1364,7 +1365,7 @@ class StoreTests(unittest.TestCase):
             restored = ResidentStore(self.path)
             self.assertEqual(
                 restored.list_residents(residence)[0].next_payment,
-                due + timedelta(days=30),
+                next_month_start(due),
             )
 
     def test_existing_due_dates_are_not_rewritten_on_reopening_store(self):
@@ -1661,7 +1662,7 @@ class StoreTests(unittest.TestCase):
             self.store.regenerate_deposit_receipt(resident_id, 0)
         self.assertIsNone(self.store.get_deposit_receipt(resident_id, 0))
 
-    def test_cycle_is_30_days_not_calendar_month(self):
+    def test_cycle_uses_calendar_month_even_for_admission_at_end_of_month(self):
         self.values["admission_date"] = "31/01/2026"
         resident_id = self.add_resident()
         self.assertEqual(self.store.list_residents(0)[0].next_payment, date(2026, 1, 31))
@@ -1669,7 +1670,7 @@ class StoreTests(unittest.TestCase):
             resident_id, 0, date(2026, 1, 31), date(2026, 2, 13), "USD",
             amount=Decimal("125.50"), payment_method="Binance",
         )
-        self.assertEqual(self.store.list_residents(0)[0].next_payment, date(2026, 3, 2))
+        self.assertEqual(self.store.list_residents(0)[0].next_payment, date(2026, 2, 1))
         self.assertEqual(self.store.payment_history(resident_id, 0), [
             {
                 "due_date": "2026-01-31", "paid_on": "2026-02-13",
@@ -1690,7 +1691,7 @@ class StoreTests(unittest.TestCase):
                 with self.subTest(residence=residence, currency=currency, method=method):
                     self.values["student_id"] = f"V-{residence}-{currency}-{method}"
                     resident_id = self.add_resident(residence)
-                    for due in (date(2026, 1, 1), date(2026, 1, 31)):
+                    for due in (date(2026, 1, 1), date(2026, 2, 1)):
                         self.store.record_payment(
                             resident_id, residence, due, date(2026, 2, 1),
                             currency, Decimal("150.50"), payment_method=method,
@@ -1767,7 +1768,7 @@ class StoreTests(unittest.TestCase):
                 "currency": "VES", "payment_method": None,
                 "amount": "125000",
                 "amount_usd": None,
-                "monthly_amount_usd": None, "late_fee_usd": "0", "late_days": "1",
+                "monthly_amount_usd": None, "late_fee_usd": "0", "late_days": "0",
                 "exchange_rate": "881.06640000",
                 "exchange_rate_date": "2026-01-31",
                 "receiving_bank": "Banco de Venezuela",
@@ -1845,7 +1846,7 @@ class StoreTests(unittest.TestCase):
                 amount=Decimal("100"), payment_method="Efectivo",
             )
         self.assertEqual(len(self.store.payment_history(resident_id, 0)), 1)
-        self.assertEqual(self.store.list_residents(0)[0].next_payment, date(2026, 1, 31))
+        self.assertEqual(self.store.list_residents(0)[0].next_payment, date(2026, 2, 1))
 
     def test_failed_payment_rolls_back_due_date(self):
         resident_id = self.add_resident()
@@ -1908,8 +1909,8 @@ class StoreTests(unittest.TestCase):
     def test_alert_thresholds(self):
         today = date(2026, 1, 1)
         for days, expected in (
-            (-1, "Vencido"), (0, "Vence hoy"), (1, "Próximo a vencer"),
-            (3, "Próximo a vencer"), (4, "Al día"),
+            (-1, "Vencido"), (0, "Pago pendiente (plazo del 1 al 5)"), (1, "Al día"),
+            (3, "Al día"), (4, "Al día"),
         ):
             with self.subTest(days=days):
                 self.assertEqual(payment_status(today + timedelta(days=days), today), expected)
@@ -2154,7 +2155,7 @@ class AppTests(unittest.TestCase):
                     resident_id, residence, due, paid, "USD", Decimal(amount),
                     payment_method=method,
                 )
-                due += timedelta(days=30)
+                due = next_month_start(due)
             with self.store._connect() as connection:
                 connection.execute(
                     "UPDATE payments SET payment_method = NULL WHERE resident_id = ? "
@@ -2193,8 +2194,8 @@ class AppTests(unittest.TestCase):
                     [
                         dict(zip(dollar_summary.columns, row))
                         for row in (
-                            ("Efectivo", "2100,10", "210,01", "2310,11"),
-                            ("Zelle", "1000,00", "20,02", "1020,02"),
+                            ("Efectivo", "2.100,10", "210,01", "2.310,11"),
+                            ("Zelle", "1.000,00", "20,02", "1.020,02"),
                             ("Binance", "8,08", "30,03", "38,11"),
                             ("No registrado", "40,04", "50,05", "90,09"),
                         )
@@ -2205,19 +2206,19 @@ class AppTests(unittest.TestCase):
                     ("Recibido en el mes (USD)", "Total recibido en el mes"),
                     ("Acumulado al cierre (USD)", "Acumulado al cierre del mes"),
                 ):
-                    total = sum(Decimal(v.replace(",", ".")) for v in dollar_summary[column])
+                    total = sum(Decimal(v.replace(".", "").replace(",", ".")) for v in dollar_summary[column])
                     overall = tab.table[1].value
                     value = overall.loc[overall["Resumen de cobros"] == label, "Dólares (USD)"].iloc[0]
-                    expected = Decimal(value.replace(",", "."))
+                    expected = Decimal(value.replace(".", "").replace(",", "."))
                     if column == "Saldo inicial / acumulado anterior (USD)":
                         expected += Decimal("8.08")
                     self.assertEqual(total, expected)
                 self.assertEqual(len(dollar_summary.columns), 4)
                 for row in dollar_summary.to_dict("records"):
                     self.assertEqual(
-                        Decimal(row["Saldo inicial / acumulado anterior (USD)"].replace(",", "."))
-                        + Decimal(row["Recibido en el mes (USD)"].replace(",", ".")),
-                        Decimal(row["Acumulado al cierre (USD)"].replace(",", ".")),
+                        Decimal(row["Saldo inicial / acumulado anterior (USD)"].replace(".", "").replace(",", "."))
+                        + Decimal(row["Recibido en el mes (USD)"].replace(".", "").replace(",", ".")),
+                        Decimal(row["Acumulado al cierre (USD)"].replace(".", "").replace(",", ".")),
                     )
                 call = next(c for c in reversed(report.call_args_list) if c.args[0] == residence)
                 self.assertEqual(call.kwargs["dollar_summary"], dollar_summary.to_dict("records"))
@@ -2227,7 +2228,7 @@ class AppTests(unittest.TestCase):
                     self.assertIn("Resumen de dólares Recibidos", text)
                     self.assertNotIn("Saldo inicial del mes", text)
                     self.assertIn("Saldo inicial / acumulado anterior", text)
-                    for expected in ("2310,11", "1020,02", "38,11", "90,09"):
+                    for expected in ("2.310,11", "1.020,02", "38,11", "90,09"):
                         self.assertIn(expected, text)
                     self.assertIn("FIRMA DEL ADMINISTRADOR", document[-1].get_text())
                     for page in document:
@@ -2269,7 +2270,7 @@ class AppTests(unittest.TestCase):
                     exchange_rate=Decimal("1"), exchange_rate_date=paid_on,
                     amount_usd=Decimal(amount), receiving_bank=bank,
                 )
-                due += timedelta(days=30)
+                due = next_month_start(due)
             with self.store._connect() as connection:
                 connection.execute(
                     "UPDATE payments SET receiving_bank = NULL WHERE resident_id = ? "
@@ -2279,7 +2280,7 @@ class AppTests(unittest.TestCase):
                 resident_id, residence, due, today, "USD", Decimal("777"),
                 payment_method="Zelle",
             )
-            due += timedelta(days=30)
+            due = next_month_start(due)
             self.store.record_payment(
                 resident_id, residence, due, today, "VES", Decimal("111"),
                 exchange_rate=Decimal("1"), exchange_rate_date=today,
@@ -2396,7 +2397,7 @@ class AppTests(unittest.TestCase):
             summary = app.tabs[residence].table[0].value
             self.assertEqual(
                 list(summary["Dólares (USD)"]),
-                ["2000,00", "1000,00", "3000,00", "0,00", "3000,00"],
+                ["2.000,00", "1.000,00", "3.000,00", "0,00", "3.000,00"],
             )
             self.assertEqual(list(summary["Bolívares (Bs.)"]), ["0,00"] * 5)
             self.assertIn("Saldo inicial", summary["Resumen de cobros"][0])
@@ -2408,7 +2409,7 @@ class AppTests(unittest.TestCase):
                 self.assertIn("Efectivo", text)
                 self.assertIn("Zelle", text)
                 self.assertIn("31/12/2025", text)
-                self.assertEqual(text.count("3000,00"), 2)
+                self.assertEqual(text.count("3.000,00"), 2)
 
     def test_current_opening_balance_is_not_monthly_resident_income(self):
         self.store.record_opening_balance(
@@ -2531,11 +2532,12 @@ class AppTests(unittest.TestCase):
         resident_id = self.store.add(0, admission_values(), [False] * 8, b"%PDF-test", None)
         self.store.record_deposit(resident_id, 0, date.today(), "Zelle", Decimal("150"))
         due = self.store.list_residents(0)[0].next_payment
-        for index in range(2):
+        for _ in range(2):
             self.store.record_payment(
-                resident_id, 0, due + timedelta(days=index * 30), date.today(),
+                resident_id, 0, due, date.today(),
                 "USD", Decimal("100"), payment_method="Efectivo",
             )
+            due = next_month_start(due)
         app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
         app.button(key="residencia_action_0_1").click().run()
         self.assertFalse(app.exception)
@@ -2619,7 +2621,7 @@ class AppTests(unittest.TestCase):
                     exchange_rate=Decimal("10"), exchange_rate_date=today,
                     receiving_bank="Banco de Venezuela",
                 )
-                due += timedelta(days=30)
+                due = next_month_start(due)
             self.store.record_payment(
                 resident_id, residence, due, today, "USD", Decimal("100"),
                 payment_method="Zelle",
@@ -2631,7 +2633,7 @@ class AppTests(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO payments (resident_id, due_date, paid_on, currency, amount) "
                     "VALUES (?, ?, ?, 'VES', NULL)",
-                    (resident_id, (due + timedelta(days=30)).isoformat(), today.isoformat()),
+                    (resident_id, next_month_start(due).isoformat(), today.isoformat()),
                 )
         with patch("monthly_report.generate_monthly_report", wraps=generate_monthly_report) as report:
             app = AppTest.from_file(str(APP_PATH), default_timeout=30).run()
@@ -2683,11 +2685,11 @@ class AppTests(unittest.TestCase):
         self.store.record_payment(
             resident_id, 0, due, previous, "USD", Decimal("100.10"), payment_method="Zelle",
         )
-        due += timedelta(days=30)
+        due = next_month_start(due)
         self.store.record_payment(
             resident_id, 0, due, today, "USD", Decimal("25.20"), payment_method="Efectivo",
         )
-        due += timedelta(days=30)
+        due = next_month_start(due)
         self.store.record_payment(
             resident_id, 0, due, today, "VES", Decimal("1000.30"),
             exchange_rate=Decimal("10.003"), exchange_rate_date=today,
@@ -2825,15 +2827,12 @@ class AppTests(unittest.TestCase):
                     item.label for item in tab.expander
                     if identities[residence, remaining] in item.label
                 )
-                self.assertEqual(label.startswith(":red["), remaining <= 3)
-                if remaining <= 3:
+                self.assertEqual(label.startswith(":red["), remaining <= 0)
+                if remaining <= 0:
                     self.assertIn(
                         (today + timedelta(days=remaining)).strftime("%d/%m/%Y"), label,
                     )
-                    expected_status = (
-                        "Vencido" if remaining < 0 else
-                        "Vence hoy" if remaining == 0 else "Próximo a vencer"
-                    )
+                    expected_status = payment_status(today + timedelta(days=remaining), today)
                     self.assertIn(expected_status, label)
             self.store.record_payment(
                 resident_ids[residence, -1], residence, today - timedelta(days=1),
@@ -2859,13 +2858,13 @@ class AppTests(unittest.TestCase):
             )
             values["student_id"] = f"V-THRESHOLD-{'LATE' if remaining < 0 else 'DUE'}-{abs(remaining)}"
             resident_id = self.store.add(0, values, [False] * 8, b"%PDF-test", None)
-            if remaining <= 3:
+            if remaining <= 0:
                 expected_pending.append(values["student_id"])
         app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
         app.button(key="residencia_action_0_1").click().run()
         self.assertEqual(len(app.expander), 7)
         app.button(key="residencia_action_0_2").click().run()
-        self.assertEqual(len(app.expander), 6)
+        self.assertEqual(len(app.expander), 3)
         for identity in expected_pending:
             self.assertTrue(any(identity in i.label for i in app.expander))
         self.assertEqual(len(self.store.list_residents(0)), 7)
@@ -2878,11 +2877,11 @@ class AppTests(unittest.TestCase):
         next(i for i in target.checkbox if i.label == "Confirmo que recibí este pago").check()
         next(i for i in target.button if i.label == "Registrar pago").click().run()
         self.assertFalse(app.exception)
-        self.assertEqual(len(app.expander), 6)
+        self.assertEqual(len(app.expander), 3)
         self.assertTrue(any("V-THRESHOLD-LATE-60" in i.label for i in app.expander))
         self.assertEqual(
             next(r.next_payment for r in self.store.list_residents(0) if r.id == resident_id),
-            date.today() - timedelta(days=30),
+            next_month_start(date.today() - timedelta(days=60)),
         )
 
     def test_pending_payment_with_manual_fee_stays_active_and_clears_pending(self):
@@ -2906,8 +2905,8 @@ class AppTests(unittest.TestCase):
                 else:
                     app.selectbox(key=f"{key}_payment_bank").select("Fondo Común").run()
                     app.text_input(key=f"{key}_payment_exchange_rate").set_value("10,1").run()
-                    self.assertTrue(any("1621,05" in i.value for i in app.info))
-                self.assertTrue(any("Total a recibir: USD 160.50" in i.value for i in app.info))
+                    self.assertTrue(any("1.621,05" in i.value for i in app.info))
+                self.assertTrue(any("Total a recibir: USD 160,50" in i.value for i in app.info))
                 next(i for i in app.checkbox if i.label == "Confirmo que recibí este pago").check()
                 self.submit(app, "Registrar pago")
                 self.assertFalse(app.error)
@@ -2989,7 +2988,7 @@ class AppTests(unittest.TestCase):
                 app.text_input(key=f"{key}_refund_deduction").set_value(discount).run()
                 expected = "150.50" if discount == "00,00" else "125.00"
                 self.assertTrue(any(
-                    f"Total a reembolsar: USD {expected}" in info.value for info in app.info
+                    f"Total a reembolsar: USD {expected.replace('.', ',')}" in info.value for info in app.info
                 ))
                 next(i for i in app.text_input if i.label == "Motivo de la baja").set_value("Fin")
                 next(i for i in app.checkbox if i.label.startswith("Confirmo la baja")).check()
@@ -3004,7 +3003,7 @@ class AppTests(unittest.TestCase):
                     app.checkbox(key=f"{key}_refund_inspection").check().run()
                     self.assertFalse(any(i.label == "Descuento del depósito (USD)" for i in app.text_input))
                     self.assertFalse(any(i.label == "Descuento por (motivo manual)" for i in app.text_area))
-                    self.assertTrue(any("Total a reembolsar: USD 150.50" in i.value for i in app.info))
+                    self.assertTrue(any("Total a reembolsar: USD 150,50" in i.value for i in app.info))
                     app.checkbox(key=f"{key}_refund_keys").uncheck().run()
                     self.assertTrue(any(i.label == "Descuento del depósito (USD)" for i in app.text_input))
                     self.assertTrue(any(i.label == "Descuento por (motivo manual)" for i in app.text_area))
@@ -3035,7 +3034,10 @@ class AppTests(unittest.TestCase):
                 self.assertEqual(first_items[0].value, "**CONSTANCIA DE ENTREGA DE DEPÓSITO**")
                 self.assertEqual(first_items[1].type, "info")
                 self.assertIn(refund["receipt_number"], first_items[1].value)
-                self.assertIn(f"Descuento: USD {Decimal(refund['deduction']):.2f}", first_items[1].value)
+                self.assertIn(
+                    "Descuento: USD " + f"{Decimal(refund['deduction']):.2f}".replace(".", ","),
+                    first_items[1].value,
+                )
                 self.assertEqual(first_items[2].type, "download_button")
                 self.assertEqual(app.session_state["latest_discharged_resident_0"], resident_id)
                 self.assertTrue(any(
@@ -3090,6 +3092,27 @@ class AppTests(unittest.TestCase):
         app.button(key="residencia_action_0_0").click().run()
         self.assertFalse(app.exception)
         return app
+
+    def test_pending_payments_does_not_request_email_configuration(self):
+        with (
+            patch("payment_reminders.MailConfig.from_environment") as mail_config,
+            patch("bcv_rate.fetch_bcv_rate", return_value=(Decimal("100"), date.today())),
+        ):
+            mail_config.side_effect = ValueError("Falta REMINDER_SMTP_PASSWORD")
+            app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+            for residence in (0, 1):
+                app.button(key=f"residencia_action_{residence}_2").click().run()
+                self.assertFalse(app.exception)
+                messages = [
+                    item.value for kind in ("info", "warning", "error", "caption")
+                    for item in app.tabs[residence].get(kind)
+                ]
+                self.assertFalse(any(
+                    "REMINDER_SMTP_PASSWORD" in message
+                    or "Recordatorios por correo pendientes de configuración" in message
+                    for message in messages
+                ))
+            mail_config.assert_not_called()
 
     def test_active_payment_forms_are_inside_closed_popovers_in_both_residences(self):
         for residence in (0, 1):
@@ -3453,7 +3476,11 @@ class AppTests(unittest.TestCase):
         expected_age = calculate_age(date(2005, 1, 1), date.today())
         self.assertEqual(resident.values["age"], expected_age)
         self.assertEqual(resident.next_payment, date.today())
-        self.assertEqual(len(app.get("download_button")), 1)
+        self.assertEqual(len(app.get("download_button")), 2)
+        self.assertTrue(any(
+            item.label == "Descargar lista de residentes activas (PDF)"
+            for item in app.get("download_button")
+        ))
         self.assertTrue(any("Vence hoy" in warning.value for warning in app.warning))
         pdf = self.store.get_pdf(resident.id, 0)
         self.assertTrue(pdf.startswith(b"%PDF-"))
@@ -3469,7 +3496,7 @@ class AppTests(unittest.TestCase):
 
         app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
         app.button(key="residencia_action_0_1").click().run()
-        self.assertEqual(len(app.get("download_button")), 1)
+        self.assertEqual(len(app.get("download_button")), 2)
         resident_key = f"resident_0_{resident.id}_False_False"
         app.selectbox(key=f"{resident_key}_payment_currency").select("Dólares").run()
         app.text_input(key=f"{resident_key}_payment_amount").set_value("125,50")
@@ -3480,7 +3507,7 @@ class AppTests(unittest.TestCase):
         next(box for box in app.checkbox if box.label == "Confirmo que recibí este pago").check()
         self.submit(app, "Registrar pago")
         self.assertEqual(
-            self.store.list_residents(0)[0].next_payment, date.today() + timedelta(days=30)
+            self.store.list_residents(0)[0].next_payment, next_month_start(date.today())
         )
         payment = self.store.payment_history(resident.id, 0)[0]
         self.assertEqual(payment["currency"], "USD")
@@ -3497,7 +3524,11 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.store.list_residents(0), [])
         self.assertEqual(app.session_state["residence_view_0"], 3)
         self.assertFalse(app.exception)
-        self.assertEqual(len(app.get("download_button")), 2)
+        self.assertEqual(len(app.get("download_button")), 3)
+        self.assertTrue(any(
+            item.label == "Descargar lista de residentes de baja (PDF)"
+            for item in app.get("download_button")
+        ))
         self.assertTrue(any("Fin de prueba" in info.value for info in app.info))
         self.assertEqual(len(self.store.payment_history(resident.id, 0)), 1)
 
@@ -3520,7 +3551,7 @@ class AppTests(unittest.TestCase):
         rate_input.set_value("881,0664")
         app.run()
         app.selectbox(key=f"{resident_key}_payment_bank").select("Banco de Venezuela").run()
-        self.assertTrue(any("Bs. 132159,96" in item.value for item in app.info))
+        self.assertTrue(any("Bs. 132.159,96" in item.value for item in app.info))
         next(
             box for box in app.checkbox
             if box.label == "Confirmo que recibí este pago"
@@ -3537,7 +3568,7 @@ class AppTests(unittest.TestCase):
         with pymupdf.open(stream=pdf, filetype="pdf") as document:
             text = document[0].get_text()
             self.assertIn("Bs. 132.159,96", text)
-            self.assertIn("Monto base: USD 150.00", text)
+            self.assertIn("Monto base: USD 150,00", text)
         self.assertTrue(
             any("Descargar recibo de mensualidad" in item.label for item in app.get("download_button"))
         )
@@ -3616,7 +3647,7 @@ class AppTests(unittest.TestCase):
             any("Forma de pago del depósito: Zelle" in item.value for item in app.markdown)
         )
         self.assertFalse(any(button.label == "Guardar depósito" for button in app.button))
-        self.assertEqual(len(app.get("download_button")), 2)
+        self.assertEqual(len(app.get("download_button")), 3)
         self.assertFalse(
             any(button.label == "Generar recibo de depósito (PDF)" for button in app.button)
         )
@@ -3642,7 +3673,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(self.store.list_residents(0), [original])
 
     def test_pending_filter_excludes_discharged_other_residence_and_later_due(self):
-        for days, residence in ((27, 0), (26, 0), (40, 0), (40, 1)):
+        for days, residence in ((30, 0), (26, 0), (40, 0), (40, 1)):
             values = admission_values((date.today() + timedelta(days=30 - days)).strftime("%d/%m/%Y"))
             values["student_id"] = f"V-{days}-{residence}"
             resident_id = self.store.add(residence, values, [False] * 8, b"%PDF-test", None)
@@ -3652,7 +3683,7 @@ class AppTests(unittest.TestCase):
         app.button(key="residencia_action_0_2").click().run()
         self.assertFalse(app.exception)
         self.assertEqual(len(app.expander), 1)
-        expected_identity = normalize_admission_values({"student_id": "V-27-0"})["student_id"]
+        expected_identity = normalize_admission_values({"student_id": "V-30-0"})["student_id"]
         self.assertIn(expected_identity, app.expander[0].label)
 
     def test_storage_error_does_not_report_success_or_save(self):

@@ -5,6 +5,12 @@ las Acacias, consultar residentes y controlar vencimientos.
 
 ## Ejecutar
 
+Los importes en bolívares y dólares se ingresan y muestran con punto de miles
+y coma decimal, por ejemplo `1.234,56`. Los montos tienen dos decimales; las
+tasas de cambio conservan su precisión. También se admiten importes simples
+con punto decimal de uno o dos dígitos (por ejemplo `150.50`) por compatibilidad,
+pero se muestran como `150,50`. Los recibos PDF ya guardados no se reescriben.
+
 ```sh
 python -m pip install -r requirements.txt
 python -m streamlit run app.py
@@ -162,6 +168,88 @@ requiriendo que se registre manualmente la tasa y fecha correspondientes.
 La consulta HTTPS conserva la validación de certificados y añade el
 intermediario Sectigo R36 que el servidor del BCV omite en su cadena TLS.
 
+## Control de Gastos
+
+Cada residencia tiene un área **Control de Gastos**. Los perfiles con permisos
+de escritura pueden registrar gastos; los perfiles de consulta solo pueden
+ver el historial y los saldos.
+
+- El concepto se introduce manualmente. Se registra la moneda (bolívares o
+  dólares), el total pagado y la fecha. Para gastos con factura, la fecha de
+  factura y pago es la misma y el número de factura es obligatorio.
+- El historial y el PDF muestran primero la fecha de registro y después la
+  fecha de factura / gasto. La segunda columna contiene la fecha de la factura
+  si existe, o la fecha del gasto si no hay factura. En registros históricos
+  anteriores a este cambio, la fecha de registro se indica como no disponible
+  porque no se almacenaba.
+- Después aparecen el número de factura, concepto, base imponible, IVA del
+  16 %, total pagado, tipo de moneda y banco/medio.
+- El total **ya incluye el IVA del 16 %**: la base se obtiene dividiendo el
+  total entre 1,16 y el IVA se desglosa automáticamente, sin aumentar el total.
+  Los gastos sin factura no tienen número de factura ni IVA desglosado.
+- La opción de factura solo está habilitada para gastos en bolívares. Los
+  gastos pagados en dólares se registran sin factura ni IVA desglosado.
+- En bolívares se selecciona el banco de salida (Banco de Venezuela, Banco
+  del Tesoro o Fondo Común). En dólares se elige Efectivo, Binance o Zelle.
+  No se convierte dinero entre cuentas automáticamente.
+- El gasto se descuenta únicamente del banco/medio y residencia indicados.
+  Los saldos disponibles suman saldos iniciales y cobros identificados, y
+  restan gastos y devoluciones. Los cobros antiguos sin importe, moneda o
+  banco/medio identificado no financian gastos. No son saldos obtenidos
+  directamente del banco: deben conciliarse con los estados de cuenta.
+- Se rechazan gastos que dejen saldo negativo, tanto en la fecha indicada
+  como en fechas posteriores ya registradas. La validación y el registro se
+  realizan dentro de una misma transacción.
+- **Registrar saldo inicial** permite registrar un saldo de arranque por
+  moneda y banco/medio, reutilizando el almacenamiento existente. No debe
+  incluir cobros que ya estén registrados para evitar duplicarlos.
+- El botón **Descargar control de gastos (PDF)** genera un reporte imprimible
+  del historial de la residencia, con fechas, facturas, base imponible, IVA,
+  total y totales por moneda. Está disponible también para perfiles
+  de consulta y cuando el historial está vacío.
+- El informe mensual y su PDF conservan los acumulados de cobros y añaden
+  una sección **Saldos disponibles al cierre del informe** que calcula los pagos
+  recibidos en el mes menos los gastos del mismo mes, por moneda y banco/medio,
+  más el saldo neto de meses anteriores y los saldos de arranque registrados
+  durante el mes, sin contarlos dos veces. Si los movimientos producen un
+  resultado negativo, se avisa que deben conciliarse en lugar de mostrarlo como
+  dinero disponible o sustituirlo por cero. En Control de Gastos,
+  los saldos disponibles al día de hoy sí descuentan los gastos registrados hasta
+  la fecha, junto con las devoluciones.
+
+Los gastos se guardan en la tabla `expenses`, en la misma base local o réplica
+Turso que los residentes. La tabla se crea al iniciar la versión actualizada;
+publicar el código no elimina ni reinicia los datos existentes.
+
+## Pago de IVA (16%)
+
+Cada residencia tiene un botón **Pago de IVA (16%)**, con selector de mes y
+actividades ordenadas cronológicamente por fecha del cobro o factura del gasto.
+El informe muestra fecha, número de factura, concepto, importe, débito fiscal
+y crédito fiscal, exclusivamente para movimientos en bolívares con factura:
+
+- El débito corresponde a cobros con número de factura (mensualidades,
+  depósitos y servicios, según la selección del portal). Usa el mismo cálculo
+  del IVA de cobros: 16 % del importe registrado.
+- El crédito corresponde al IVA incluido y guardado en los gastos con factura.
+- El resultado es **débito fiscal menos crédito fiscal**. Si es negativo,
+  se muestra un saldo a favor; no se permite registrar un pago ni se arrastra
+  automáticamente el crédito a otros meses.
+- Los perfiles de escritura pueden registrar el pago completo del resultado
+  positivo, indicando banco, fecha y referencia y confirmando que ya se pagó.
+  Esto no realiza una transferencia bancaria.
+- Solo se admite un pago por residencia y mes. El registro guarda los totales
+  utilizados y crea un gasto sin factura ni crédito fiscal, dentro de la misma
+  transacción. Se descuenta del banco y aparece en Control de Gastos y en los
+  saldos del mes de pago, sin descontarlo dos veces.
+- Si se modifican las facturas después del pago, se muestra una advertencia
+  para conciliar la diferencia; no se altera el pago ya registrado.
+- Los perfiles de consulta pueden ver y descargar el informe, pero no registrar
+  pagos. El PDF incluye las actividades, totales y datos del pago si existe.
+
+El informe utiliza los datos y reglas del portal; la clasificación fiscal de
+las facturas debe verificarse antes de declarar el impuesto.
+
 ## Ingresos y residentes
 
 1. Tras iniciar sesión con permisos de administración, el formulario de **Nuevo Ingreso** se muestra desplegado al abrir cada
@@ -212,13 +300,32 @@ intermediario Sectigo R36 que el servidor del BCV omite en su cadena TLS.
    y la **cama** asignadas. Si falta alguna, se muestran los campos pendientes
    y no se genera la planilla ni se registra la residente. Los demás campos
    opcionales y los ingresos ya guardados no cambian.
-   Cada cobro siguiente vence a los **30 días** del vencimiento anterior.
-   No son meses calendario. Los vencimientos de ingresos ya guardados se conservan.
-   La alerta aparece desde
-   **3 días antes**, el día del vencimiento y mientras siga vencido.
+   La primera mensualidad se cobra al ingresar. Los cobros siguientes comienzan
+   el **día 1 de cada mes calendario**, independientemente del día del ingreso.
+   El plazo mensual es del **1 al 5**; el retardo comienza el **día 6**.
+   La alerta aparece al ingresar y desde el día 1 de cada mes, hasta registrar
+   el pago; no se anticipa al mes siguiente.
+   Para ingresos existentes, la adaptación se realiza una sola vez: si no hay
+   mensualidades pagadas, se conserva el cobro inicial; si las hay, el próximo
+   cobro pasa al día 1 del mes posterior al último vencimiento cubierto.
+   Los pagos, recibos y bajas anteriores no se reescriben.
 4. **Pagos Pendientes** muestra las residentes activas con esos avisos.
+   **Residentes Activas** y **Residentes de Baja** permiten descargar su lista
+   en PDF, también con acceso de solo consulta. El PDF respeta la búsqueda y
+   corresponde únicamente a la residencia seleccionada, con numeración consecutiva.
+   La lista de activas incluye fecha de ingreso, nombre y apellidos, cédula,
+   celular, habitación y cama. La lista de bajas incluye fecha de ingreso,
+   nombre y apellidos, cédula, fecha de egreso y motivos del egreso.
+   En todos los cuadros de ambas residencias, en pantalla y en los PDF nuevos,
+   los encabezados están centrados y en negrita. Las fechas, numeración, cédulas,
+   teléfonos, habitaciones, camas, montos y tasas están centrados.
+   Los nombres, conceptos, bancos, medios de pago y motivos del egreso se alinean
+   a la izquierda, aunque contengan números. En las fichas de datos personales,
+   la columna de valor se alinea según el tipo de dato de cada fila.
+   El historial de gastos usa el mismo cuadro estático que los demás informes
+   para respetar estas alineaciones. Los PDF ya guardados no se reescriben.
    En **Residentes Activas**, el nombre y la cédula se resaltan en rojo
-   cuando el cobro está vencido, vence hoy o en los próximos tres días,
+   cuando hay un cobro pendiente desde su fecha de inicio,
    junto con el estado y la fecha de vencimiento, sin abrir la ficha.
    El resaltado se actualiza según el próximo vencimiento después de cada pago;
    no se aplica al historial de bajas.
@@ -285,8 +392,8 @@ intermediario Sectigo R36 que el servidor del BCV omite en su cadena TLS.
    totales, acumulados y resumen por banco, en pantalla y en el PDF.
    La tasa BCV usa los mismos separadores y conserva sus cuatro decimales.
    El IVA no se aplica a depósitos, devoluciones ni pagos en dólares.
-   Los montos en bolívares de los recibos usan punto como separador de miles
-   y coma decimal, siempre con dos decimales: **Bs. 28.384,16**. Esta regla
+   Los montos en bolívares y dólares de los recibos usan punto como separador de miles
+   y coma decimal, siempre con dos decimales: **Bs. 28.384,16** y **USD 1.234,56**. Esta regla
    incluye mensualidad, subtotal, IVA y total, sin cambiar los valores guardados
    ni la precisión de la tasa BCV. Los recibos ya guardados no se reescriben
    automáticamente.
@@ -318,8 +425,8 @@ intermediario Sectigo R36 que el servidor del BCV omite en su cadena TLS.
    ni ejecuta un reembolso. Los pagos mensuales se registran
    por separado; los pagos anteriores no se reclasifican como depósitos.
    **Registrar pago** requiere confirmar la recepción, seleccionar Bolívares o
-   Dólares y cubre un solo período, avanzando el vencimiento 30 días desde su
-   fecha anterior, no desde el día de pago. Para Bolívares se ingresa el monto
+   Dólares y cubre un solo período, avanzando el próximo cobro al día 1 del mes
+   siguiente al período pagado, no desde el día de pago. Para Bolívares se ingresa el monto
    de la mensualidad en dólares y se indica manualmente la tasa BCV y su fecha.
    Se muestra el total a recibir en bolívares (dólares × tasa), redondeado a dos
    decimales, con los medios céntimos hacia arriba. Se guardan el monto base en
@@ -345,12 +452,13 @@ intermediario Sectigo R36 que el servidor del BCV omite en su cadena TLS.
    Si falla la generación o el guardado, no se registra el pago ni se modifica
    el próximo vencimiento. El monto admite como máximo dos decimales.
    Los pagos anteriores a esta función conservan su historial sin PDF.
-   **Pagos Pendientes** incluye las residentes activas desde tres días antes del
-   vencimiento, el día del vencimiento y durante todo el atraso, sin quitarlas
+   **Pagos Pendientes** incluye las residentes activas al ingresar y desde el
+   día 1 del mes pendiente, durante todo el plazo y el atraso, sin quitarlas
    de **Residentes Activas**. Al cubrir un período se vuelve a evaluar el próximo
-   vencimiento: si todavía está vencido o a tres días de vencer, sigue en pendientes.
-   Los días de retardo se cuentan desde el día siguiente al vencimiento hasta
-   la fecha del pago. La mora no se calcula automáticamente: se ingresa manualmente
+   cobro: si todavía hay otro mes pendiente, sigue en pendientes.
+   Los días de retardo mensual se cuentan desde el día 6 hasta la fecha del pago.
+   Para el cobro inicial en una fecha distinta del día 1, se cuentan desde el
+   día siguiente al ingreso. La mora no se calcula automáticamente: se ingresa manualmente
    en USD al registrar un pago atrasado (cero si no se cobra recargo).
    Se muestran mensualidad, mora y total antes de confirmar. En bolívares se
    convierte el total en USD (mensualidad más mora) con la tasa BCV manual y
@@ -476,6 +584,8 @@ intermediario Sectigo R36 que el servidor del BCV omite en su cadena TLS.
 
 Las alertas visuales funcionan sin configurar correo. Los recordatorios externos
 requieren la configuración y el proceso independiente descritos a continuación.
+La vista **Pagos Pendientes** no solicita configurar credenciales de correo
+ni muestra avisos por su ausencia; esa configuración puede realizarse más adelante.
 Recarga la vista para actualizar fechas si quedó abierta al cambiar de día.
 Los datos de un formulario sin guardar no son un ingreso permanente: deben
 enviarse con el botón de guardado. Los registros creados antes de existir esta
@@ -484,10 +594,10 @@ base de datos no se recuperan automáticamente.
 ## Recordatorios de mensualidad por correo
 
 El proceso [payment_reminders.py](./payment_reminders.py) envía un recordatorio
-diario a las residentes activas cuyo próximo vencimiento sea dentro de tres días,
-hoy o esté vencido. Usa el correo guardado en el ingreso, con el nombre y la
+diario a las residentes activas con un cobro pendiente desde el ingreso o desde
+el día 1 del mes. Usa el correo guardado en el ingreso, con el nombre y la
 razón social correspondientes a cada residencia. Para fechas pasadas dice
-«venció el», para hoy «vence hoy» y para fechas futuras «vence el próximo».
+«venció el» y durante los días 1 al 5 indica el plazo mensual de pago.
 Incluye «EVITA PAGOS POR MORA. ¡Muchas gracias!». No adjunta datos adicionales,
 planillas ni recibos; cada correo tiene una sola destinataria.
 
@@ -497,7 +607,7 @@ incluso al reiniciar el proceso, ejecutar dos procesos simultáneos o pagar un
 período y seguir teniendo otro vencido. Se comprueba el próximo vencimiento
 antes de reservar el envío; si cambió o la residente fue dada de baja, no se
 reserva ese recordatorio. Después de un pago, la siguiente revisión usa el
-nuevo vencimiento. Las residentes de baja y las que vencen en más de tres días
+nuevo vencimiento. Las residentes de baja y las que aún no tienen un cobro pendiente
 no reciben avisos.
 
 ### Configurar Gmail sin publicar credenciales
@@ -576,5 +686,5 @@ python -m unittest discover -s tests -v
 ```
 
 Las pruebas usan bases temporales y datos ficticios. Comprueban persistencia,
-aislamiento de residencias, PDF, ciclos de 30 días, alertas, duplicados, pagos,
+aislamiento de residencias, PDF, meses calendario, alertas, duplicados, pagos,
 bajas y navegación de Streamlit.

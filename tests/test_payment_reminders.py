@@ -61,9 +61,9 @@ class PaymentReminderTests(unittest.TestCase):
             inactive = self.add(-1, residence)
             self.store.discharge(inactive, residence, self.now.date(), "Fin")
         result = run_reminders(self.store, self.now, self.config, dry_run=False)
-        self.assertEqual(result["eligible"], 12)
-        self.assertEqual(result["sent"], 12)
-        self.assertEqual(self.send.call_count, 12)
+        self.assertEqual(result["eligible"], 6)
+        self.assertEqual(result["sent"], 6)
+        self.assertEqual(self.send.call_count, 6)
         for message, _ in (call.args for call in self.send.call_args_list):
             self.assertEqual(message["To"], "resident@example.com")
             self.assertIsNone(message["Cc"])
@@ -240,7 +240,7 @@ class PaymentReminderTests(unittest.TestCase):
             self.assertEqual(main(), 1)
         self.send.assert_not_called()
 
-    def test_pending_view_reports_missing_configuration_and_failed_attempts(self):
+    def test_pending_view_hides_missing_configuration_but_reports_failed_attempts(self):
         self.add(-1)
         resident = self.store.list_residents(0)[0]
         today = datetime.now(VENEZUELA).date()
@@ -256,7 +256,7 @@ class PaymentReminderTests(unittest.TestCase):
             ).run()
             app.button(key="residencia_action_0_2").click().run()
         self.assertFalse(app.exception)
-        self.assertTrue(any(
+        self.assertFalse(any(
             "REMINDER_SMTP_PASSWORD" in message.value for message in app.tabs[0].info
         ))
         self.assertTrue(any(

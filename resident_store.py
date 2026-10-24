@@ -3,21 +3,23 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Callable, Generator, TypedDict
 
 import db
 from deposit_receipt import (
-    SERVICE_CONCEPTS, generate_deposit_receipt, generate_monthly_receipt, generate_refund_receipt,
+    SERVICE_CONCEPTS, generate_deposit_receipt,
+    generate_monthly_receipt, generate_refund_receipt,
 )
 from resident_format import format_identity, format_phone, normalize_invoice_number
+from vat_report import VatReport, calculate_vat_report
+from payment_schedule import late_payment_days, next_month_start, payment_deadline
 
 
 DATABASE_PATH = Path(os.environ.get("RESIDENCIAS_DATA_DIR", Path(__file__).parent / "data")) / "residencias.sqlite3"
-PAYMENT_PERIOD = timedelta(days=30)
-ALERT_DAYS = 3
+ALERT_DAYS = 0
 BANKS = ("Banco de Venezuela", "Banco del Tesoro", "Fondo Común")
 
 
@@ -51,6 +53,12 @@ def _validate_payment_currency(
             raise ValueError("La conversión desde dólares solo aplica a pagos en bolívares.")
         return None
     raise ValueError("Selecciona Bolívares o Dólares como moneda del pago.")
+
+
+def calculate_expense_vat(total: Decimal) -> Decimal:
+    return (total * Decimal("16") / Decimal("116")).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP,
+    )
 
 
 def bolivars_from_dollars(amount_usd: Decimal, rate: Decimal) -> Decimal:
@@ -116,6 +124,24 @@ class OpeningBalance(TypedDict):
     description: str
 
 
+class Expense(TypedDict):
+    id: int
+    concept: str
+    paid_on: str
+    registered_on: str | None
+    currency: str
+    payment_method: str
+    amount: str
+    invoice_number: str | None
+    vat: str
+
+
+class AccountBalance(TypedDict):
+    currency: str
+    payment_method: str
+    amount: Decimal
+
+
 def calculate_age(birth_date: date, today: date) -> str:
     if birth_date > today:
         raise ValueError("La fecha de nacimiento no puede ser futura.")
@@ -156,13 +182,13 @@ class Resident:
 
 
 def payment_status(due: date, today: date) -> str:
+    if due.day == 1 and due <= today <= payment_deadline(due):
+        return "Pago pendiente (plazo del 1 al 5)"
     remaining = (due - today).days
     if remaining < 0:
         return "Vencido"
     if remaining == 0:
         return "Vence hoy"
-    if remaining <= ALERT_DAYS:
-        return "Próximo a vencer"
     return "Al día"
 
 
@@ -186,7 +212,8 @@ class ResidentStore:
                     admission_date TEXT NOT NULL,
                     next_payment TEXT NOT NULL,
                     discharged_on TEXT,
-                    discharge_reason TEXT
+                    discharge_reason TEXT,
+                    calendar_billing INTEGER NOT NULL DEFAULT 1
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS active_resident_identity
                     ON residents (residence, identity)
@@ -232,6 +259,29 @@ class ResidentStore:
                     description TEXT NOT NULL,
                     PRIMARY KEY (residence, currency, payment_method)
                 );
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id INTEGER PRIMARY KEY,
+                    residence INTEGER NOT NULL CHECK (residence IN (0, 1)),
+                    concept TEXT NOT NULL,
+                    paid_on TEXT NOT NULL,
+                    currency TEXT NOT NULL CHECK (currency IN ('USD', 'VES')),
+                    payment_method TEXT NOT NULL,
+                    amount TEXT NOT NULL,
+                    invoice_number TEXT,
+                    vat TEXT NOT NULL,
+                    registered_on TEXT
+                );
+                CREATE INDEX IF NOT EXISTS expenses_residence_date
+                    ON expenses (residence, paid_on);
+                CREATE TABLE IF NOT EXISTS vat_payments (
+                    residence INTEGER NOT NULL CHECK (residence IN (0, 1)),
+                    month TEXT NOT NULL,
+                    expense_id INTEGER NOT NULL UNIQUE REFERENCES expenses(id),
+                    reference TEXT NOT NULL,
+                    debit TEXT NOT NULL,
+                    credit TEXT NOT NULL,
+                    PRIMARY KEY (residence, month)
+                );
                 CREATE TABLE IF NOT EXISTS service_payments (
                     id INTEGER PRIMARY KEY,
                     resident_id INTEGER NOT NULL REFERENCES residents(id),
@@ -258,6 +308,12 @@ class ResidentStore:
                 );
                 """
             )
+            expense_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(expenses)")
+            }
+            if "registered_on" not in expense_columns:
+                connection.execute("ALTER TABLE expenses ADD COLUMN registered_on TEXT")
             counter_schema = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE name = 'receipt_counters'"
             ).fetchone()["sql"]
@@ -305,6 +361,33 @@ class ResidentStore:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN receipt_number TEXT")
                 if "invoice_number" not in columns:
                     connection.execute(f"ALTER TABLE {table} ADD COLUMN invoice_number TEXT")
+            resident_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(residents)")
+            }
+            if "calendar_billing" not in resident_columns:
+                connection.execute(
+                    "ALTER TABLE residents ADD COLUMN calendar_billing INTEGER NOT NULL DEFAULT 0"
+                )
+            connection.commit()
+            connection.execute("BEGIN IMMEDIATE")
+            legacy_residents = connection.execute(
+                "SELECT r.id, r.admission_date, r.discharged_on, MAX(p.due_date) AS last_due "
+                "FROM residents r LEFT JOIN payments p ON p.resident_id = r.id "
+                "WHERE r.calendar_billing = 0 GROUP BY r.id"
+            ).fetchall()
+            for resident in legacy_residents:
+                if resident["discharged_on"] is None:
+                    due = (
+                        next_month_start(date.fromisoformat(resident["last_due"]))
+                        if resident["last_due"] else date.fromisoformat(resident["admission_date"])
+                    )
+                    connection.execute(
+                        "UPDATE residents SET next_payment = ? WHERE id = ?",
+                        (due.isoformat(), resident["id"]),
+                    )
+                connection.execute(
+                    "UPDATE residents SET calendar_billing = 1 WHERE id = ?", (resident["id"],)
+                )
 
     def _require_write(self) -> None:
         if self.authorize_write is not None:
@@ -375,8 +458,8 @@ class ResidentStore:
                 """
                 INSERT INTO residents (
                     residence, identity, values_json, documents_json, pdf, photo,
-                    admission_date, next_payment
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    admission_date, next_payment, calendar_billing
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     residence, identity, json.dumps(values, ensure_ascii=False),
@@ -524,7 +607,7 @@ class ResidentStore:
             raise ValueError("La cantidad recibida debe ser un número válido.") from error
         if not received_amount.is_finite() or received_amount <= 0:
             raise ValueError("La cantidad recibida debe ser mayor que cero.")
-        late_days = max(0, (paid_on - expected_due).days)
+        late_days = late_payment_days(expected_due, paid_on)
         try:
             fee = Decimal(late_fee_usd)
             if (
@@ -535,7 +618,7 @@ class ResidentStore:
         except (InvalidOperation, TypeError) as error:
             raise ValueError("El monto de mora no es válido.") from error
         if fee > 0 and late_days == 0:
-            raise ValueError("No se puede cobrar mora antes ni el día del vencimiento.")
+            raise ValueError("No se puede cobrar mora antes de finalizar el plazo de pago.")
         base = monthly_amount_usd
         if base is None:
             if currency == "USD":
@@ -569,7 +652,7 @@ class ResidentStore:
                 "UPDATE residents SET next_payment = ? WHERE id = ? "
                 "AND residence = ? AND discharged_on IS NULL AND next_payment = ?",
                 (
-                    (expected_due + PAYMENT_PERIOD).isoformat(), resident_id,
+                    next_month_start(expected_due).isoformat(), resident_id,
                     residence, expected_due.isoformat(),
                 ),
             )
@@ -811,6 +894,206 @@ class ResidentStore:
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _account_movements(connection: sqlite3.Connection, residence: int) -> list[sqlite3.Row]:
+        return connection.execute(
+            "SELECT as_of AS paid_on, currency, payment_method, amount, 1 AS direction "
+            "FROM opening_balances WHERE residence = ? "
+            "UNION ALL "
+            "SELECT p.paid_on, p.currency, "
+            "CASE WHEN p.currency = 'VES' THEN p.receiving_bank ELSE p.payment_method END, "
+            "p.amount, 1 FROM payments p JOIN residents r ON r.id = p.resident_id "
+            "WHERE r.residence = ? "
+            "UNION ALL "
+            "SELECT d.paid_on, d.currency, d.payment_method, d.amount, 1 "
+            "FROM deposits d JOIN residents r ON r.id = d.resident_id WHERE r.residence = ? "
+            "UNION ALL "
+            "SELECT s.paid_on, s.currency, "
+            "CASE WHEN s.currency = 'VES' THEN s.receiving_bank ELSE s.payment_method END, "
+            "s.amount, 1 FROM service_payments s JOIN residents r ON r.id = s.resident_id "
+            "WHERE r.residence = ? "
+            "UNION ALL "
+            "SELECT d.refunded_on, d.currency, d.payment_method, d.amount, -1 "
+            "FROM deposit_refunds d JOIN residents r ON r.id = d.resident_id "
+            "WHERE r.residence = ? "
+            "UNION ALL "
+            "SELECT paid_on, currency, payment_method, amount, -1 FROM expenses "
+            "WHERE residence = ? ORDER BY paid_on",
+            (residence,) * 6,
+        ).fetchall()
+
+    @staticmethod
+    def _movement_amount(row: sqlite3.Row) -> Decimal:
+        if row["amount"] is None:
+            return Decimal("0")
+        try:
+            amount = Decimal(row["amount"])
+        except InvalidOperation as error:
+            raise ValueError("Hay un movimiento con un importe no válido; revisa los registros.") from error
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("Hay un movimiento con un importe no válido; revisa los registros.")
+        return amount * row["direction"]
+
+    def account_balances(self, residence: int, through: date) -> list[AccountBalance]:
+        totals = {
+            **{("VES", bank): Decimal("0") for bank in BANKS},
+            **{("USD", method): Decimal("0") for method in ("Efectivo", "Binance", "Zelle")},
+        }
+        with self._connect() as connection:
+            for row in self._account_movements(connection, residence):
+                key = (row["currency"], row["payment_method"])
+                if key in totals and row["paid_on"] <= through.isoformat():
+                    totals[key] += self._movement_amount(row)
+        return [
+            AccountBalance(currency=currency, payment_method=method, amount=amount)
+            for (currency, method), amount in totals.items()
+        ]
+
+    def expenses(self, residence: int, through: date) -> list[Expense]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id, concept, paid_on, currency, payment_method, amount, "
+                "invoice_number, vat, registered_on FROM expenses "
+                "WHERE residence = ? AND paid_on <= ? ORDER BY paid_on DESC, id DESC",
+                (residence, through.isoformat()),
+            ).fetchall()
+        return [Expense(**dict(row)) for row in rows]
+
+    def record_expense(
+        self, residence: int, concept: str, paid_on: date, currency: str,
+        payment_method: str, amount: Decimal, *, with_invoice: bool = False,
+        invoice_number: str = "",
+    ) -> int:
+        self._require_write()
+        methods = BANKS if currency == "VES" else ("Efectivo", "Binance", "Zelle")
+        if residence not in (0, 1) or currency not in {"VES", "USD"} or payment_method not in methods:
+            raise ValueError("Selecciona una residencia, moneda y banco o medio de pago válidos.")
+        if not concept.strip() or paid_on > date.today():
+            raise ValueError("Indica el concepto y una fecha de pago que no sea futura.")
+        if currency == "USD" and with_invoice:
+            raise ValueError("Los gastos pagados en dólares no pueden registrarse con factura.")
+        try:
+            valid = amount.is_finite() and amount > 0 and amount == amount.quantize(Decimal("0.01"))
+        except InvalidOperation as error:
+            raise ValueError("El total pagado excede el tamaño permitido.") from error
+        if not valid:
+            raise ValueError("El total pagado debe ser positivo, con máximo dos decimales.")
+        number = invoice_number.strip()
+        if with_invoice and (not number or len(number) > 40):
+            raise ValueError("Indica un número de factura de hasta 40 caracteres.")
+        if not with_invoice and number:
+            raise ValueError("Un gasto sin factura no puede tener número de factura.")
+        vat = calculate_expense_vat(amount) if with_invoice else Decimal("0")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            return self._insert_expense(
+                connection, residence, concept.strip(), paid_on, currency,
+                payment_method, amount, number, vat,
+            )
+
+    def _insert_expense(
+        self, connection: sqlite3.Connection, residence: int, concept: str,
+        paid_on: date, currency: str, payment_method: str, amount: Decimal,
+        invoice_number: str, vat: Decimal,
+    ) -> int:
+        daily: dict[str, Decimal] = {paid_on.isoformat(): Decimal("0")}
+        for row in self._account_movements(connection, residence):
+            if row["currency"] == currency and row["payment_method"] == payment_method:
+                day = row["paid_on"]
+                daily[day] = daily.get(day, Decimal("0")) + self._movement_amount(row)
+        balance = Decimal("0")
+        for day, movement in sorted(daily.items()):
+            balance += movement
+            if day >= paid_on.isoformat() and balance < amount:
+                raise ValueError(
+                    "Saldo insuficiente en el banco o medio seleccionado. "
+                    "El gasto no puede dejar saldo negativo en su fecha ni en fechas posteriores."
+                )
+        cursor = connection.execute(
+            "INSERT INTO expenses (residence, concept, paid_on, currency, payment_method, "
+            "amount, invoice_number, vat, registered_on) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (residence, concept, paid_on.isoformat(), currency, payment_method,
+             str(amount), invoice_number or None, str(vat), date.today().isoformat()),
+        )
+        if cursor.lastrowid is None:
+            raise RuntimeError("No se obtuvo el identificador del gasto guardado.")
+        return cursor.lastrowid
+
+    @staticmethod
+    def _vat_report(connection: sqlite3.Connection, residence: int, month: date) -> VatReport:
+        start = month.replace(day=1)
+        end = date(start.year + (start.month == 12), start.month % 12 + 1, 1)
+        rows = connection.execute(
+            "SELECT paid_on, kind, invoice_number, concept, amount, vat FROM ("
+            "SELECT p.paid_on, 'Cobro' AS kind, p.invoice_number, "
+            "'Mensualidad' AS concept, p.amount, NULL AS vat, p.currency, r.residence "
+            "FROM payments p JOIN residents r ON r.id = p.resident_id "
+            "UNION ALL "
+            "SELECT p.paid_on, 'Cobro', p.invoice_number, 'Depósito de ingreso', "
+            "p.amount, NULL, p.currency, r.residence "
+            "FROM deposits p JOIN residents r ON r.id = p.resident_id "
+            "UNION ALL "
+            "SELECT p.paid_on, 'Cobro', p.invoice_number, p.concept, "
+            "p.amount, NULL, p.currency, r.residence "
+            "FROM service_payments p JOIN residents r ON r.id = p.resident_id "
+            "UNION ALL "
+            "SELECT paid_on, 'Gasto', invoice_number, concept, amount, vat, currency, residence "
+            "FROM expenses) WHERE residence = ? AND currency = 'VES' "
+            "AND TRIM(COALESCE(invoice_number, '')) != '' "
+            "AND paid_on >= ? AND paid_on < ? AND paid_on <= ? "
+            "ORDER BY paid_on, kind, invoice_number",
+            (residence, start.isoformat(), end.isoformat(), date.today().isoformat()),
+        ).fetchall()
+        return calculate_vat_report([dict(row) for row in rows])
+
+    def vat_report(self, residence: int, month: date) -> VatReport:
+        with self._connect() as connection:
+            return self._vat_report(connection, residence, month)
+
+    def vat_payment(self, residence: int, month: date) -> dict[str, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT v.reference, v.debit, v.credit, e.paid_on, e.payment_method, e.amount "
+                "FROM vat_payments v JOIN expenses e ON e.id = v.expense_id "
+                "WHERE v.residence = ? AND v.month = ?",
+                (residence, month.replace(day=1).isoformat()),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def record_vat_payment(
+        self, residence: int, month: date, paid_on: date, bank: str,
+        reference: str, expected_amount: Decimal,
+    ) -> None:
+        self._require_write()
+        month = month.replace(day=1)
+        if (
+            residence not in (0, 1) or bank not in BANKS or not reference.strip()
+            or paid_on > date.today() or paid_on < month
+        ):
+            raise ValueError("Indica residencia, banco, referencia y fecha de pago válidos.")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute(
+                "SELECT 1 FROM vat_payments WHERE residence = ? AND month = ?",
+                (residence, month.isoformat()),
+            ).fetchone():
+                raise ValueError("El pago del IVA de este mes ya está registrado.")
+            report = self._vat_report(connection, residence, month)
+            if report.net <= 0:
+                raise ValueError("No hay IVA pendiente de pago en este mes.")
+            if report.net != expected_amount:
+                raise ValueError("El IVA del mes cambió. Actualiza el informe antes de pagar.")
+            expense_id = self._insert_expense(
+                connection, residence, f"Pago de IVA (16%) - {month:%m/%Y}",
+                paid_on, "VES", bank, report.net, "", Decimal("0"),
+            )
+            connection.execute(
+                "INSERT INTO vat_payments (residence, month, expense_id, reference, debit, credit) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (residence, month.isoformat(), expense_id, reference.strip(),
+                 str(report.debit), str(report.credit)),
+            )
 
     def deposit_date(self, resident_id: int, residence: int) -> date | None:
         deposit = self.deposit_details(resident_id, residence)

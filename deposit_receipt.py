@@ -5,13 +5,15 @@ import pymupdf
 from num2words import num2words
 
 from resident_format import format_identity, normalize_invoice_number
+from money_format import format_money
+from payment_schedule import late_payment_days
 
 
 SERVICE_CONCEPTS = ("De Nevera", "De Aire Acondicionado", "Llaves")
 
 
 def format_bolivars(amount: Decimal) -> str:
-    return f"{amount:,.2f}".translate(str.maketrans(",.", ".,"))
+    return format_money(amount)
 
 
 def calculate_receipt_vat(amount: Decimal) -> Decimal:
@@ -61,25 +63,25 @@ def generate_monthly_receipt(
     if service_concept is not None and service_concept not in SERVICE_CONCEPTS:
         raise ValueError("Selecciona un concepto de servicio válido.")
     fields: list[tuple[str, str]] = []
-    late_days = max(0, (paid_on - due_date).days)
+    late_days = late_payment_days(due_date, paid_on)
     if late_days:
         monthly = (
-            f"USD {monthly_amount_usd:.2f}"
+            f"USD {format_money(monthly_amount_usd)}"
             if monthly_amount_usd is not None else
-            f"USD {amount_usd - late_fee_usd:.2f}" if amount_usd is not None else
-            f"USD {amount - late_fee_usd:.2f}" if currency == "USD" else
+            f"USD {format_money(amount_usd - late_fee_usd)}" if amount_usd is not None else
+            f"USD {format_money(amount - late_fee_usd)}" if currency == "USD" else
             f"Bs. {format_bolivars(amount - late_fee_usd)}"
         )
         fields.extend([
-            ("Mensualidad:", monthly if monthly.startswith("Bs.") else monthly.replace(".", ",")),
+            ("Mensualidad:", monthly),
             ("Días de retardo:", str(late_days)),
-            ("Mora:", f"USD {late_fee_usd:.2f}".replace(".", ",")),
+            ("Mora:", f"USD {format_money(late_fee_usd)}"),
         ])
     if currency == "VES":
         if exchange_rate is None or exchange_rate_date is None:
             raise ValueError("El recibo en bolívares requiere la tasa BCV y su fecha.")
         if amount_usd is not None:
-            fields.append(("Monto base:", f"USD {amount_usd:.2f}"))
+            fields.append(("Monto base:", f"USD {format_money(amount_usd)}"))
         fields.extend([
             ("Tasa BCV:", f"Bs. {str(exchange_rate).replace('.', ',')} por USD."),
             ("Fecha de la tasa:", f"{exchange_rate_date:%d/%m/%Y}."),
@@ -116,8 +118,8 @@ def generate_refund_receipt(
     receipt_number: str,
 ) -> bytes:
     fields = [
-        ("DEPÓSITO ORIGINAL:", f"USD {deposit_amount:.2f}".replace(".", ",")),
-        ("DESCUENTO:", f"USD {deduction:.2f}".replace(".", ",")),
+        ("DEPÓSITO ORIGINAL:", f"USD {format_money(deposit_amount)}"),
+        ("DESCUENTO:", f"USD {format_money(deduction)}"),
         ("LLAVES ENTREGADAS:", "Sí" if keys_returned else "No"),
         ("REVISIÓN:", "SIN NOVEDAD" if inspection_ok else "Con novedades"),
     ]
@@ -155,10 +157,7 @@ def _generate_receipt(
         raise ValueError("El monto del recibo debe tener como máximo dos decimales.")
     if currency not in {"USD", "VES"}:
         raise ValueError("La moneda del recibo debe ser USD o VES.")
-    formatted_amount = (
-        format_bolivars(amount) if currency == "VES"
-        else f"{amount:.2f}".replace(".", ",")
-    )
+    formatted_amount = format_money(amount)
     total = f"{'USD' if currency == 'USD' else 'Bs.'} {formatted_amount}"
     words = (
         f"{num2words(int(amount), lang='es').upper()} "

@@ -13,6 +13,7 @@ from email.utils import formataddr, make_msgid
 from zoneinfo import ZoneInfo
 
 from resident_store import ALERT_DAYS, Resident, ResidentStore
+from payment_schedule import payment_deadline
 
 
 LOGGER = logging.getLogger(__name__)
@@ -52,7 +53,9 @@ def build_reminder(resident: Resident, today: datetime, config: MailConfig) -> E
     residence = RESIDENCE_NAMES[resident.residence]
     due = resident.next_payment
     local_date = today.astimezone(VENEZUELA).date()
-    if due < local_date:
+    if due.day == 1 and due <= local_date <= payment_deadline(due):
+        deadline = f"está pendiente; plazo del 1 al 5 de {due:%m/%Y}"
+    elif due < local_date:
         deadline = f"venció el {due:%d/%m/%Y}"
     elif due == local_date:
         deadline = f"vence hoy {due:%d/%m/%Y}"

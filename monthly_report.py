@@ -1,13 +1,74 @@
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from html import escape
 from io import BytesIO
 
 import pymupdf
 
+from deposit_receipt import format_bolivars
 from resident_format import format_identity
+from table_format import is_numeric_column
 
 
-CENTERED_COLUMNS = {"Habitación", "Cama", "N.º de factura"}
+def calculate_monthly_available_summary(
+    bank_totals: dict[str, dict[str, Decimal]],
+    dollar_totals: dict[str, dict[str, Decimal]],
+    expenses: list[dict[str, str]],
+    initial_balances: list[dict[str, str | Decimal]],
+    start: date,
+    through: date,
+) -> list[dict[str, str]]:
+    expense_totals: dict[tuple[str, str], Decimal] = {}
+    for expense in expenses:
+        paid_on = date.fromisoformat(expense["paid_on"])
+        if not start <= paid_on <= through:
+            continue
+        try:
+            amount = Decimal(expense["amount"])
+        except InvalidOperation as error:
+            raise ValueError("Hay un gasto con un importe no válido.") from error
+        if not amount.is_finite() or amount < 0:
+            raise ValueError("Hay un gasto con un importe no válido.")
+        key = (expense["currency"], expense["payment_method"])
+        expense_totals[key] = expense_totals.get(key, Decimal("0")) + amount
+
+    starting_totals: dict[tuple[str, str], Decimal] = {}
+    for balance in initial_balances:
+        key = (str(balance["currency"]), str(balance["payment_method"]))
+        starting_totals[key] = starting_totals.get(key, Decimal("0")) + Decimal(balance["amount"])
+
+    def format_amount(currency: str, amount: Decimal) -> str:
+        return format_bolivars(amount)
+
+    rows = []
+    for currency, groups in (("VES", bank_totals), ("USD", dollar_totals)):
+        for method, totals in groups.items():
+            key = (currency, method)
+            starting = (
+                starting_totals.get(key, Decimal("0"))
+                + totals.get("opening", Decimal("0"))
+                - totals.get("opening_previous", Decimal("0"))
+            )
+            received = totals["current"]
+            spent = expense_totals.get(key, Decimal("0"))
+            available = starting + received - spent
+            if available < 0:
+                raise ValueError(
+                    f"Los movimientos de {method} ({currency}) no cuadran: "
+                    f"saldo inicial {format_amount(currency, starting)} + "
+                    f"cobros {format_amount(currency, received)} - "
+                    f"gastos {format_amount(currency, spent)}. "
+                    "Revisa el saldo inicial y los movimientos de esta cuenta."
+                )
+            rows.append({
+                "Banco / medio de pago": method,
+                "Moneda": currency,
+                "Saldo inicial / meses anteriores": format_amount(currency, starting),
+                "Pagos recibidos en el mes": format_amount(currency, received),
+                "Gastos del mes": format_amount(currency, spent),
+                "Saldo disponible al cierre": format_amount(currency, available),
+            })
+    return rows
 
 
 def generate_monthly_report(
@@ -19,6 +80,7 @@ def generate_monthly_report(
     *,
     bank_summary: list[dict[str, str]] | None = None,
     dollar_summary: list[dict[str, str]] | None = None,
+    available_summary: list[dict[str, str]] | None = None,
 ) -> bytes:
     def cell(tag: str, label: str, value: str) -> str:
         if tag == "th" and label.casefold() == "cédula de identidad":
@@ -34,7 +96,7 @@ def generate_monthly_report(
             else escape(formatted)
         )
         css_classes = []
-        if label in CENTERED_COLUMNS:
+        if tag == "th" or is_numeric_column(label):
             css_classes.append("centered")
         if label == "Residente":
             css_classes.append("resident-divider")
@@ -59,6 +121,7 @@ def generate_monthly_report(
         "body { font-family: sans-serif; font-size: 8pt; }"
         "table { width: 100%; border-collapse: collapse; margin-bottom: 12pt; }"
         "th, td { border: 0.5pt solid #777; padding: 4pt; }"
+        "td { text-align: left; }"
         "th.centered, td.centered { text-align: center; }"
         "th.resident-divider, td.resident-divider { border-right: 0.5pt solid #777; }"
         "th.identity-divider, td.identity-divider { border-left: 0.5pt solid #777; }"
@@ -132,6 +195,13 @@ def generate_monthly_report(
         "<p>Acumulado de saldos iniciales y cobros recibidos, no saldo disponible. "
         "No descuenta gastos ni devoluciones.</p>"
     )
+    if available_summary:
+        append_table(available_summary, "Saldos disponibles al cierre del informe")
+        append_block(
+            "<p>Total de pagos recibidos en el mes menos gastos realizados en el mes, "
+            "más el saldo anterior y los saldos de arranque del mes, separado por moneda y banco "
+            "o medio de pago.</p>"
+        )
     if warning:
         append_block(f"<p><b>Advertencia:</b> {escape(warning)}</p>")
     if html:

@@ -8,21 +8,43 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import pymupdf
-import pandas as pd
 import streamlit as st
 
 from bcv_rate import BCV_WEBSITE_URL, fetch_bcv_rate
 from deposit_receipt import SERVICE_CONCEPTS, calculate_receipt_vat, format_bolivars
-from monthly_report import generate_monthly_report
-from payment_reminders import MailConfig, VENEZUELA
+from expense_export import generate_expense_report
+from monthly_report import calculate_monthly_available_summary, generate_monthly_report
+from payment_reminders import VENEZUELA
 from portal_auth import RESIDENCE_NAMES, require_login, render_user_management, select_residence_area
 from resident_format import format_resident_display_name
+from resident_export import generate_resident_report
+from money_format import format_money, parse_money
+from table_format import style_table
+from payment_schedule import billing_today, late_payment_days
+from vat_report import generate_vat_pdf
 from resident_store import (
-    ALERT_DAYS, BANKS, ResidentStore, bolivars_from_dollars, calculate_age,
+    ALERT_DAYS, BANKS, Resident, ResidentStore, bolivars_from_dollars, calculate_age, calculate_expense_vat,
     normalize_admission_values, payment_status,
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_money_input(key: str) -> None:
+    value = st.session_state[key]
+    if value.strip():
+        try:
+            st.session_state[key] = format_money(parse_money(value))
+        except InvalidOperation:
+            st.error("Importe no válido. Usa punto de miles y coma decimal: 1.234,56.")
+
+
+def _money_input(label: str, *, key: str, **kwargs) -> str:
+    return st.text_input(
+        label, key=key, on_change=_normalize_money_input, args=(key,), **kwargs,
+    )
+
+
 ADMISSION_TEMPLATE = Path(__file__).with_name(
     "Planilla_de_Ingreso_Residencia_Carmen_Luisa.pdf"
 )
@@ -377,7 +399,7 @@ def _render_admission_form(tab_index: int, store: ResidentStore) -> None:
     st.caption(
         "Al guardar el ingreso se registrarán los datos y la planilla en Residentes "
         "Activas. La primera mensualidad vence el día del ingreso; las siguientes, "
-        "cada 30 días. "
+        "el día 1 de cada mes, con plazo de pago hasta el día 5. "
         "La plantilla y las firmas originales no se modifican."
     )
 
@@ -618,6 +640,278 @@ def _render_admission_form(tab_index: int, store: ResidentStore) -> None:
         st.rerun()
 
 
+def _available_balance_rows(store: ResidentStore, residence: int, through: date) -> list[dict[str, str]]:
+    return [
+        {
+            "Banco / medio de pago": balance["payment_method"],
+            "Moneda": balance["currency"],
+            "Saldo disponible": format_bolivars(balance["amount"]),
+        }
+        for balance in store.account_balances(residence, through)
+    ]
+
+
+def _render_expenses(residence: int, store: ResidentStore, *, can_write: bool) -> None:
+    today = date.today()
+    key = f"expenses_{residence}"
+    st.subheader("Control de Gastos")
+    notice = st.session_state.pop(f"{key}_notice", None)
+    if notice:
+        st.success(notice)
+    st.markdown("**Saldos disponibles al día de hoy**")
+    try:
+        available_rows = _available_balance_rows(store, residence, today)
+    except ValueError as error:
+        LOGGER.warning("No se pudieron calcular los saldos de gastos: %s", error)
+        st.error(f"No se pueden calcular los saldos ni registrar gastos. {error}")
+        return
+    st.table(style_table(available_rows))
+    st.caption(
+        "Saldos iniciales más cobros, menos gastos y devoluciones, separados por residencia. "
+        "Los cobros antiguos sin importe, moneda o banco/medio identificado no financian gastos. "
+        "Estos saldos contables no sustituyen la conciliación con el banco."
+    )
+    if can_write:
+        with st.popover("Registrar saldo inicial"):
+            with st.form(f"{key}_opening"):
+                opening_currency = st.selectbox(
+                    "Moneda del saldo inicial", ["VES", "USD"], key=f"{key}_opening_currency",
+                )
+                opening_method = st.selectbox(
+                    "Banco / medio del saldo inicial",
+                    [*BANKS, "Efectivo", "Binance", "Zelle"], key=f"{key}_opening_method",
+                )
+                opening_date = st.date_input(
+                    "Fecha del saldo inicial", value=today, max_value=today,
+                    format="DD/MM/YYYY", key=f"{key}_opening_date",
+                )
+                opening_amount = st.text_input(
+                    "Importe del saldo inicial", key=f"{key}_opening_amount",
+                    placeholder="Ejemplo: 1.000,00",
+                )
+                opening_description = st.text_input(
+                    "Descripción del saldo inicial", key=f"{key}_opening_description",
+                )
+                opening_submit = st.form_submit_button("Guardar saldo inicial")
+            if opening_submit:
+                try:
+                    store.record_opening_balance(
+                        residence, opening_date, opening_currency, opening_method,
+                        parse_money(opening_amount), opening_description,
+                    )
+                except InvalidOperation:
+                    st.error("Introduce un importe válido para el saldo inicial.")
+                except ValueError as error:
+                    st.error(str(error))
+                except sqlite3.IntegrityError:
+                    st.error("Ya existe un saldo inicial para esta moneda y banco o medio de pago.")
+                else:
+                    st.session_state[f"{key}_notice"] = "Saldo inicial guardado."
+                    st.rerun()
+        st.markdown("**Registrar gasto**")
+        currency = st.selectbox(
+            "Moneda del gasto", ["VES", "USD"],
+            format_func=lambda value: "Bolívares" if value == "VES" else "Dólares",
+            key=f"{key}_currency",
+        )
+        method = st.selectbox(
+            "Banco de salida" if currency == "VES" else "Medio de pago en dólares",
+            BANKS if currency == "VES" else ("Efectivo", "Binance", "Zelle"),
+            key=f"{key}_{currency}_method",
+        )
+        invoice_key = f"{key}_with_invoice"
+        if currency == "USD":
+            st.session_state[invoice_key] = False
+        with_invoice = st.checkbox(
+            "Gasto con factura" if currency == "VES" else "Gasto con factura (no disponible en dólares)",
+            key=invoice_key,
+            disabled=currency == "USD",
+        )
+        amount_input = _money_input(
+            "Total pagado (IVA incluido si tiene factura)", key=f"{key}_amount",
+            placeholder="Ejemplo: 116,00",
+        )
+        amount = None
+        amount_error = None
+        if amount_input.strip():
+            try:
+                amount = parse_money(amount_input)
+                if (
+                    not amount.is_finite() or amount <= 0
+                    or amount != amount.quantize(Decimal("0.01"))
+                ):
+                    amount_error = "El total debe ser positivo, con máximo dos decimales."
+                elif with_invoice:
+                    vat = calculate_expense_vat(amount)
+                    st.info(
+                        f"Base imponible: {format_bolivars(amount - vat)} {currency}. "
+                        f"IVA (16% incluido): {format_bolivars(vat)} {currency}. "
+                        f"Total pagado: {format_bolivars(amount)} {currency}."
+                    )
+            except InvalidOperation:
+                amount_error = "Introduce un total pagado válido."
+        if amount_error:
+            st.error(amount_error)
+        with st.form(f"{key}_form", clear_on_submit=False):
+            concept = st.text_input("Concepto del gasto", key=f"{key}_concept")
+            paid_on = st.date_input(
+                "Fecha de la factura y pago" if with_invoice else "Fecha del gasto",
+                value=today, max_value=today, format="DD/MM/YYYY", key=f"{key}_date",
+            )
+            invoice_number = (
+                st.text_input("Número de factura", max_chars=40, key=f"{key}_invoice")
+                if with_invoice else ""
+            )
+            confirmed = st.checkbox("Confirmo el registro de este gasto", key=f"{key}_confirmed")
+            submit = st.form_submit_button("Guardar gasto")
+        if submit:
+            if not confirmed:
+                st.error("Confirma el registro del gasto.")
+            elif amount is None or amount_error:
+                st.error(amount_error or "Introduce el total pagado.")
+            else:
+                try:
+                    store.record_expense(
+                        residence, concept, paid_on, currency, method, amount,
+                        with_invoice=with_invoice, invoice_number=invoice_number,
+                    )
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.session_state[f"{key}_notice"] = "Gasto guardado y descontado del saldo."
+                    for suffix in ("concept", "invoice", "confirmed", "amount"):
+                        st.session_state.pop(f"{key}_{suffix}", None)
+                    st.rerun()
+    st.markdown("**Historial de gastos**")
+    expenses = store.expenses(residence, today)
+    if not expenses:
+        st.info("No hay gastos registrados en esta residencia.")
+    else:
+        st.table(style_table([
+            {
+                "Fecha de registro del gasto": (
+                    date.fromisoformat(expense["registered_on"]).strftime("%d/%m/%Y")
+                    if expense["registered_on"] else "No disponible"
+                ),
+                "Fecha de factura / gasto": date.fromisoformat(
+                    expense["paid_on"]
+                ).strftime("%d/%m/%Y"),
+                "Nro. de factura": expense["invoice_number"] or "Sin factura",
+                "Concepto": expense["concept"],
+                "Base imponible": format_bolivars(Decimal(expense["amount"]) - Decimal(expense["vat"]))
+                if expense["invoice_number"] else "No aplica",
+                "IVA 16%": format_bolivars(Decimal(expense["vat"])),
+                "Total pagado": format_bolivars(Decimal(expense["amount"])),
+                "Tipo de moneda": expense["currency"],
+                "Banco / medio": expense["payment_method"],
+            }
+            for expense in expenses
+        ]))
+    st.download_button(
+        "Descargar control de gastos (PDF)",
+        data=generate_expense_report(residence, expenses, today),
+        file_name=f"control_gastos_residencia_{residence + 1}_{today:%Y%m%d}.pdf",
+        mime="application/pdf",
+        key=f"{key}_download",
+    )
+
+
+def _render_vat_payments(residence: int, store: ResidentStore, *, can_write: bool) -> None:
+    today = date.today()
+    key = f"vat_{residence}"
+    st.subheader("Pago de IVA (16%)")
+    notice = st.session_state.pop(f"{key}_notice", None)
+    if notice:
+        st.success(notice)
+    months = {today.replace(day=1)}
+    for movement in [*store.received_payments(residence, today), *store.expenses(residence, today)]:
+        activity_date = date.fromisoformat(movement["paid_on"])
+        if activity_date <= today:
+            months.add(activity_date.replace(day=1))
+    month = st.selectbox(
+        "Mes del IVA", sorted(months, reverse=True),
+        format_func=lambda value: value.strftime("%m/%Y"), key=f"{key}_month",
+    )
+    try:
+        report = store.vat_report(residence, month)
+    except ValueError as error:
+        LOGGER.warning("No se pudo calcular el IVA: %s", error)
+        st.error(str(error))
+        return
+    st.caption(
+        "Solo actividades en bolívares con número de factura, ordenadas por fecha del cobro "
+        "o de la factura del gasto. El débito utiliza el IVA de los cobros (16% del importe, "
+        "igual que en Pagos recibidos); el crédito utiliza el IVA incluido en los gastos. "
+        "No incluye actividades en dólares ni movimientos sin factura."
+    )
+    if report.entries:
+        st.table(style_table(report.entries))
+    else:
+        st.info("No hay actividades con factura en bolívares para este mes.")
+    st.table(style_table([
+        {"Concepto": "Débito fiscal", "Bolívares (Bs.)": format_bolivars(report.debit)},
+        {"Concepto": "Crédito fiscal", "Bolívares (Bs.)": format_bolivars(report.credit)},
+        {"Concepto": "IVA A PAGAR:", "Bolívares (Bs.)": format_bolivars(report.net)},
+    ]))
+    payment = store.vat_payment(residence, month)
+    if payment:
+        st.markdown("**Pago de IVA registrado**")
+        st.table(style_table([{
+            "Fecha": date.fromisoformat(payment["paid_on"]).strftime("%d/%m/%Y"),
+            "Banco": payment["payment_method"],
+            "Referencia": payment["reference"],
+            "Importe (Bs.)": format_bolivars(Decimal(payment["amount"])),
+            "Débito al pagar (Bs.)": format_bolivars(Decimal(payment["debit"])),
+            "Crédito al pagar (Bs.)": format_bolivars(Decimal(payment["credit"])),
+        }]))
+        if Decimal(payment["debit"]) != report.debit or Decimal(payment["credit"]) != report.credit:
+            st.warning(
+                "Las facturas del mes cambiaron después del pago. El pago guardado conserva "
+                "los importes originales; concilia la diferencia antes de realizar otro ajuste."
+            )
+    elif report.net <= 0:
+        st.info(
+            "No hay IVA por pagar." if report.net == 0 else
+            f"Saldo a favor del mes: Bs. {format_bolivars(-report.net)}. "
+            "No se traslada automáticamente a otros meses."
+        )
+    elif can_write:
+        with st.form(f"{key}_payment_{month}"):
+            st.write(f"IVA por pagar: Bs. {format_bolivars(report.net)}")
+            bank = st.selectbox("Banco de salida del IVA", BANKS, key=f"{key}_bank")
+            paid_on = st.date_input(
+                "Fecha del pago de IVA", value=today, min_value=month, max_value=today,
+                format="DD/MM/YYYY", key=f"{key}_date_{month}",
+            )
+            reference = st.text_input("Referencia del pago de IVA", key=f"{key}_reference")
+            confirmed = st.checkbox("Confirmo que realicé el pago del IVA", key=f"{key}_confirmed")
+            submitted = st.form_submit_button("Registrar pago de IVA")
+        if submitted:
+            if not confirmed:
+                st.error("Confirma el pago del IVA antes de registrarlo.")
+            else:
+                try:
+                    store.record_vat_payment(residence, month, paid_on, bank, reference, report.net)
+                except ValueError as error:
+                    st.error(str(error))
+                else:
+                    st.session_state[f"{key}_notice"] = (
+                        "Pago de IVA guardado y descontado del banco. No genera crédito fiscal."
+                    )
+                    st.rerun()
+    try:
+        pdf = generate_vat_pdf(residence, month, report, payment)
+    except (ValueError, OSError, pymupdf.FileDataError):
+        LOGGER.exception("Error al generar el informe de IVA")
+        st.error("No se pudo generar el PDF del IVA. Los registros guardados no cambiaron.")
+    else:
+        st.download_button(
+            "Descargar informe de IVA (PDF)", pdf,
+            file_name=f"IVA_{residence}_{month:%Y_%m}.pdf",
+            mime="application/pdf", key=f"{key}_pdf",
+        )
+
+
 def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write: bool = True) -> None:
     today = date.today()
     payments = store.received_payments(tab_index, today)
@@ -627,6 +921,8 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
         report_months.add(date.fromisoformat(payment["paid_on"]).replace(day=1))
     for balance in opening_balances:
         report_months.add(date.fromisoformat(balance["as_of"]).replace(day=1))
+    for expense in store.expenses(tab_index, today):
+        report_months.add(date.fromisoformat(expense["paid_on"]).replace(day=1))
     report_month = st.selectbox(
         "Mes del informe",
         sorted(report_months, reverse=True),
@@ -740,7 +1036,7 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
                 "Banco receptor": payment.get("receiving_bank") or (
                     "No registrado" if currency == "VES" else "—"
                 ),
-                "Dólares (USD)": f"{amount:.2f}".replace(".", ",")
+                "Dólares (USD)": format_money(amount)
                 if valid and currency == "USD" else "—",
                 "Forma de pago USD": payment.get("payment_method") or (
                     "No registrado" if currency == "USD" else "—"
@@ -753,14 +1049,10 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
             "Residente": "TOTAL",
             "Bolívares (Bs.)": format_bolivars(current["VES"]),
             "IVA (16%) (Bs.)": format_bolivars(monthly_vat),
-            "Dólares (USD)": f"{current['USD']:.2f}".replace(".", ","),
+            "Dólares (USD)": format_money(current["USD"]),
         })
         st.markdown("**Resumen de cobros**")
-        collection_table = pd.DataFrame(collection_rows).style.set_properties(
-            subset=["Habitación", "Cama", "N.º de factura"],
-            **{"text-align": "center"},
-        )
-        st.table(collection_table)
+        st.table(style_table(collection_rows))
         with st.expander("Ingresar o corregir números de factura") if can_write else nullcontext():
             if can_write:
                 st.caption(
@@ -839,14 +1131,14 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
             ),
             "Bolívares (Bs.)": format_bolivars(balance_amount)
             if balance["currency"] == "VES" else "0,00",
-            "Dólares (USD)": f"{balance_amount:.2f}".replace(".", ",")
+            "Dólares (USD)": format_money(balance_amount)
             if balance["currency"] == "USD" else "0,00",
         })
     summary = opening_rows + [
         {
             "Resumen de cobros": label,
             "Bolívares (Bs.)": format_bolivars(amounts["VES"]),
-            "Dólares (USD)": f"{amounts['USD']:.2f}".replace(".", ","),
+            "Dólares (USD)": format_money(amounts["USD"]),
         }
         for label, amounts in (
             ("Acumulado de meses anteriores", {
@@ -860,7 +1152,7 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
         )
     ]
     st.markdown("**Totales y acumulados**")
-    st.table(summary)
+    st.table(style_table(summary))
     def grouped_summary(
         groups: dict[str, dict[str, Decimal]], group_label: str, unit: str,
     ) -> list[dict[str, str]]:
@@ -874,8 +1166,7 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
             rows.append({
                 group_label: method,
                 **{
-                    label: format_bolivars(value) if unit == "Bs."
-                    else f"{value:.2f}".replace(".", ",")
+                    label: format_money(value)
                     for label, value in amounts.items()
                 },
             })
@@ -884,7 +1175,7 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
     bank_summary = grouped_summary(bank_totals, "Banco receptor", "Bs.")
     dollar_summary = grouped_summary(dollar_totals, "Forma de pago USD", "USD")
     st.markdown("**Resumen de Bolivares en Bancos**")
-    st.table(bank_summary)
+    st.table(style_table(bank_summary))
     st.caption(
         "Cada banco muestra saldos iniciales y cobros acumulados, no saldo bancario disponible. "
         "Saldo inicial / acumulado anterior reúne los cobros anteriores y todos los "
@@ -892,17 +1183,39 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
         "Los pagos sin banco identificado se muestran como «No registrado»."
     )
     st.markdown("**Resumen de dólares Recibidos**")
-    st.table(dollar_summary)
+    st.table(style_table(dollar_summary))
     st.caption(
         "Solo incluye dólares realmente recibidos y saldos iniciales en USD. "
         "Saldo inicial / acumulado anterior reúne los cobros anteriores y todos los "
         "saldos de arranque registrados hasta este mes, una sola vez. "
         "No incluye la base en dólares de pagos recibidos en bolívares ni descuenta devoluciones."
     )
+    available_summary = None
+    try:
+        available_summary = calculate_monthly_available_summary(
+            bank_totals, dollar_totals,
+            store.expenses(tab_index, report_through),
+            store.account_balances(tab_index, start - timedelta(days=1)),
+            start, report_through,
+        )
+    except ValueError as error:
+        LOGGER.warning("No se pudieron calcular los saldos del informe: %s", error)
+        balance_warning = f"No se muestran saldos disponibles. {error}"
+        st.warning(balance_warning)
+        warning = f"{warning} {balance_warning}".strip()
+    else:
+        st.markdown("**Saldos disponibles al cierre del informe**")
+        st.table(style_table(available_summary))
+        st.caption(
+            "Saldo anterior y saldos de arranque del mes + pagos recibidos en el mes "
+            "− gastos realizados en el mes = saldo disponible al cierre, por moneda "
+            "y banco o medio de pago."
+        )
     try:
         pdf = generate_monthly_report(
             tab_index, report_month, collection_rows, summary, warning,
             bank_summary=bank_summary, dollar_summary=dollar_summary,
+            available_summary=available_summary,
         )
     except (ValueError, OSError, pymupdf.FileDataError):
         LOGGER.exception("Error al generar la lista mensual de pagos")
@@ -914,6 +1227,25 @@ def _render_monthly_received(tab_index: int, store: ResidentStore, *, can_write:
             file_name=f"Pagos_Recibidos_{tab_index}_{report_month:%Y_%m}.pdf",
             mime="application/pdf", key=f"monthly_received_pdf_{tab_index}",
         )
+
+
+def _render_resident_list_download(
+    residence: int, residents: list[Resident], *, inactive: bool,
+) -> None:
+    status = "baja" if inactive else "activas"
+    try:
+        pdf = generate_resident_report(residence, residents, date.today(), inactive=inactive)
+    except (ValueError, OSError, pymupdf.FileDataError):
+        LOGGER.exception("Error al generar la lista de residentes %s", status)
+        st.error("No se pudo generar el PDF de la lista de residentes. Los registros no cambiaron.")
+    else:
+        st.download_button(
+            f"Descargar lista de residentes {'de baja' if inactive else 'activas'} (PDF)",
+            data=pdf,
+            file_name=f"Residentes_{status}_{residence}_{date.today():%Y_%m_%d}.pdf",
+            mime="application/pdf", key=f"resident_list_pdf_{residence}_{status}",
+        )
+        st.caption("El PDF incluye las residentes de esta vista y respeta la búsqueda por nombre o cédula.")
 
 
 def _render_readonly_residents(tab_index: int, store: ResidentStore, view: int) -> None:
@@ -931,31 +1263,44 @@ def _render_readonly_residents(tab_index: int, store: ResidentStore, view: int) 
     }
 
     def payment_details(payment) -> None:
-        st.table([{
-            labels.get(field, field): value if value is not None and value != "" else "Sin indicar"
+        st.table(style_table([{
+            labels.get(field, field): (
+                format_money(Decimal(value))
+                if field in {
+                    "amount", "amount_usd", "monthly_amount_usd", "late_fee_usd",
+                    "deposit_amount", "deduction",
+                } and value is not None and value != ""
+                else value if value is not None and value != "" else "Sin indicar"
+            )
             for field, value in payment.items()
             if field not in ("receipt_pdf", "id", "resident_id")
-        }])
+        }]))
 
     st.subheader({1: "Residentes Activas", 2: "Pagos Pendientes", 3: "Residentes de Baja"}[view])
     st.caption("Solo consulta y descarga. No se permiten cambios en los registros.")
     search = st.text_input("Buscar por nombre o cédula", key=f"readonly_search_{tab_index}_{view}").strip().casefold()
     residents = store.list_residents(tab_index, inactive=view == 3)
-    today = date.today()
+    today = billing_today()
+    residents = [
+        resident for resident in residents
+        if (view != 2 or (resident.next_payment - today).days <= ALERT_DAYS)
+        and (not search or any(
+            search in resident.values[field].casefold()
+            for field in ("student_name", "student_id")
+        ))
+    ]
+    if view in (1, 3):
+        _render_resident_list_download(tab_index, residents, inactive=view == 3)
     shown = 0
     for resident in residents:
-        if view == 2 and (resident.next_payment - today).days > ALERT_DAYS:
-            continue
-        if search and not any(search in resident.values[field].casefold() for field in ("student_name", "student_id")):
-            continue
         shown += 1
         label = f"{resident.values['student_name']} — {resident.values['student_id']}"
         if view != 3 and (resident.next_payment - today).days <= ALERT_DAYS:
             label = label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
             label = f":red[{label} — {payment_status(resident.next_payment, today)} ({resident.next_payment:%d/%m/%Y})]"
         with st.expander(label):
-            st.table([{"Dato": label, "Valor": resident.values.get(field) or "Sin indicar"} for field, label in PERSONAL_FIELDS.items()])
-            st.table([{"Recaudo": label, "Consignado": "Sí" if checked else "No"} for label, checked in zip(DOCUMENT_LABELS, resident.documents)])
+            st.table(style_table([{"Dato": label, "Valor": resident.values.get(field) or "Sin indicar"} for field, label in PERSONAL_FIELDS.items()]))
+            st.table(style_table([{"Recaudo": label, "Consignado": "Sí" if checked else "No"} for label, checked in zip(DOCUMENT_LABELS, resident.documents)]))
             st.write(f"Próximo cobro: {resident.next_payment:%d/%m/%Y} — {payment_status(resident.next_payment, today)}")
             if resident.discharged_on:
                 st.write(f"Baja: {resident.discharged_on:%d/%m/%Y}. Motivo: {resident.discharge_reason}")
@@ -1008,7 +1353,7 @@ def _render_service_payment(
             "Moneda del pago del servicio",
             ["Selecciona una moneda", "Bolívares", "Dólares"], key=f"{key}_service_currency",
         )
-        amount_input = st.text_input(
+        amount_input = _money_input(
             "Monto del servicio en dólares (USD)", placeholder="Ejemplo: 20,00",
             key=f"{key}_service_amount",
         ).strip()
@@ -1016,7 +1361,7 @@ def _render_service_payment(
         error_message = None
         if amount_input:
             try:
-                amount = Decimal(amount_input.replace(",", "."))
+                amount = parse_money(amount_input)
                 if (
                     not amount.is_finite() or amount <= 0
                     or amount != amount.quantize(Decimal("0.01"))
@@ -1139,23 +1484,13 @@ def _render_residents(
         st.caption("Consulta los datos, planillas, pagos y recibos de las residentes dadas de baja.")
     else:
         st.caption(
-            "Primera mensualidad el día del ingreso; siguientes cada 30 días. "
-            "Aviso desde 3 días antes. "
-            "Cada pago registrado cubre un período de 30 días, sin mover el calendario "
-            "original. Los recordatorios por correo requieren configurar Gmail "
+            "Primera mensualidad el día del ingreso; siguientes el día 1 de cada mes, "
+            "con plazo de pago del 1 al 5 y retardo desde el día 6. "
+            "La alerta permanece hasta registrar el pago. Cada pago cubre un mes pendiente, "
+            "sin saltar mensualidades atrasadas. Los recordatorios por correo requieren configurar Gmail "
             "y mantener activo el proceso de envíos."
         )
     if pending_only:
-        try:
-            MailConfig.from_environment()
-        except ValueError as error:
-            st.info(f"Recordatorios por correo pendientes de configuración. {error}")
-        else:
-            st.caption(
-                "Correo configurado: el proceso de recordatorios debe estar activo "
-                "para enviar desde las 08:00, hora de Venezuela. Configurar Gmail "
-                "no inicia el proceso automáticamente."
-            )
         reminder_counts = store.reminder_counts(
             tab_index, datetime.now(VENEZUELA).date(),
         )
@@ -1176,7 +1511,7 @@ def _render_residents(
             "Ver historial de bajas", key=f"show_inactive_{tab_index}"
         )
     residents = store.list_residents(tab_index, inactive=inactive)
-    today = date.today()
+    today = billing_today()
     alerted = [
         resident for resident in residents
         if (resident.next_payment - today).days <= ALERT_DAYS
@@ -1184,13 +1519,14 @@ def _render_residents(
     if pending_only:
         residents = alerted
         st.caption(
-            "Se incluyen desde 3 días antes del vencimiento y permanecen aquí mientras "
-            "el próximo pago esté pendiente dentro de ese plazo. También siguen en Residentes Activas."
+            "Se incluyen al ingresar y desde el día 1 de cada mes, hasta registrar "
+            "la mensualidad pendiente. El plazo de pago mensual es del 1 al 5. "
+            "También siguen en Residentes Activas."
         )
     elif alerted and not inactive:
         st.warning(
-            f"{len(alerted)} residente(s) con cobro vencido, para hoy o en los próximos "
-            "3 días. Revisa las fechas indicadas abajo."
+            f"{len(alerted)} residente(s) con mensualidad pendiente de pago. "
+            "Revisa las fechas indicadas abajo."
         )
     search = st.text_input(
         "Buscar por nombre o cédula",
@@ -1202,6 +1538,8 @@ def _render_residents(
             if search in resident.values["student_name"].casefold()
             or search in resident.values["student_id"].casefold()
         ]
+    if not pending_only:
+        _render_resident_list_download(tab_index, residents, inactive=inactive)
     if not residents:
         st.info("No hay residentes que mostrar en esta vista.")
         return
@@ -1232,9 +1570,9 @@ def _render_residents(
                 st.markdown("**CONSTANCIA DE ENTREGA DE DEPÓSITO**")
                 st.info(
                     f"Constancia N.º {refund['receipt_number']} — "
-                    f"Depósito: USD {Decimal(refund['deposit_amount']):.2f} — "
-                    f"Descuento: USD {Decimal(refund['deduction']):.2f} — "
-                    f"Reembolso: USD {Decimal(refund['amount']):.2f}."
+                    f"Depósito: USD {format_money(Decimal(refund['deposit_amount']))} — "
+                    f"Descuento: USD {format_money(Decimal(refund['deduction']))} — "
+                    f"Reembolso: USD {format_money(Decimal(refund['amount']))}."
                 )
                 st.download_button(
                     "**Descargar constancia de entrega de depósito (PDF)**",
@@ -1242,15 +1580,15 @@ def _render_residents(
                     file_name=f"Constancia_Entrega_Deposito_{refund['receipt_number']}.pdf",
                     mime="application/pdf", key=f"{key}_refund_receipt",
                 )
-            st.table([
+            st.table(style_table([
                 {"Dato": label, "Valor": resident.values.get(field) or "Sin indicar"}
                 for field, label in PERSONAL_FIELDS.items()
-            ])
+            ]))
             st.markdown("**Recaudos consignados**")
-            st.table([
+            st.table(style_table([
                 {"Recaudo": label, "Consignado": "Sí" if checked else "No"}
                 for label, checked in zip(DOCUMENT_LABELS, resident.documents)
-            ])
+            ]))
             st.download_button(
                 "Descargar planilla completada (PDF)",
                 data=store.get_pdf(resident.id, tab_index),
@@ -1306,7 +1644,7 @@ def _render_residents(
                 st.write(
                     "Monto recibido del depósito: "
                     + (
-                        f"USD {deposit['amount'].replace('.', ',')}"
+                        f"USD {format_money(Decimal(deposit['amount']))}"
                         if deposit["amount"] else "No registrado"
                     )
                 )
@@ -1345,7 +1683,7 @@ def _render_residents(
                         try:
                             store.record_deposit(
                                 resident.id, tab_index, paid_on, deposit_method,
-                                Decimal(deposit_amount_input.replace(",", ".")),
+                                parse_money(deposit_amount_input),
                             )
                         except InvalidOperation:
                             st.error("Ingresa un monto del depósito válido mayor que cero.")
@@ -1390,7 +1728,7 @@ def _render_residents(
                     f"Próximo cobro: {resident.next_payment:%d/%m/%Y} — "
                     f"{payment_status(resident.next_payment, today)}"
                 )
-                if resident.next_payment < today:
+                if late_payment_days(resident.next_payment, today):
                     st.error(due_text)
                 elif (resident.next_payment - today).days <= ALERT_DAYS:
                     st.warning(due_text)
@@ -1415,17 +1753,17 @@ def _render_residents(
                     amount = None
                     monthly_amount_usd = None
                     late_fee_usd = Decimal("0")
-                    late_days = max(0, (today - resident.next_payment).days)
+                    late_days = late_payment_days(resident.next_payment, today)
                     late_fee_error = None
                     if currency != "Selecciona una moneda":
-                        amount_input = st.text_input(
+                        amount_input = _money_input(
                             "Monto de mensualidad en dólares (USD)",
                             placeholder="Ejemplo: 150,00",
                             key=f"{key}_payment_amount",
                         ).strip()
                         if amount_input:
                             try:
-                                parsed_amount = Decimal(amount_input.replace(",", "."))
+                                parsed_amount = parse_money(amount_input)
                                 if parsed_amount.is_finite() and parsed_amount > 0:
                                     amount = parsed_amount
                             except InvalidOperation:
@@ -1433,12 +1771,12 @@ def _render_residents(
                         monthly_amount_usd = amount
                         if late_days:
                             st.warning(f"Días de retardo: {late_days}. La mora se ingresa manualmente.")
-                            late_fee_input = st.text_input(
+                            late_fee_input = _money_input(
                                 "Monto de mora (USD)", value="0",
                                 key=f"{key}_payment_late_fee",
                             ).strip()
                             try:
-                                late_fee_usd = Decimal(late_fee_input.replace(",", "."))
+                                late_fee_usd = parse_money(late_fee_input)
                                 if (
                                     not late_fee_usd.is_finite() or late_fee_usd < 0
                                     or late_fee_usd != late_fee_usd.quantize(Decimal("0.01"))
@@ -1451,9 +1789,9 @@ def _render_residents(
                         if amount is not None and late_fee_error is None:
                             amount += late_fee_usd
                             st.info(
-                                f"Mensualidad: USD {monthly_amount_usd:.2f}. "
-                                f"Mora: USD {late_fee_usd:.2f}. "
-                                f"Total a recibir: USD {amount:.2f}."
+                                f"Mensualidad: USD {format_money(monthly_amount_usd)}. "
+                                f"Mora: USD {format_money(late_fee_usd)}. "
+                                f"Total a recibir: USD {format_money(amount)}."
                             )
                     payment_method = None
                     exchange_rate = None
@@ -1498,7 +1836,7 @@ def _render_residents(
                             else:
                                 st.info(
                                     "Bolívares a recibir: **Bs. "
-                                    + f"{amount:.2f}".replace(".", ",")
+                                    + format_money(amount)
                                     + "**"
                                 )
                     elif currency == "Dólares":
@@ -1564,7 +1902,8 @@ def _render_residents(
                             )
                             st.session_state[f"residents_notice_{tab_index}"] = (
                                 "Pago guardado. Recibo de mensualidad disponible en el historial. "
-                                "El próximo vencimiento avanzó 30 días."
+                                "El próximo cobro corresponde al día 1 del mes siguiente "
+                                "al período pagado."
                             )
                             st.rerun()
                 if not pending_only:
@@ -1590,7 +1929,7 @@ def _render_residents(
                         if keys_returned and inspection_ok:
                             st.info("Llaves entregadas y SIN NOVEDAD: devolución completa, sin descuento.")
                         else:
-                            discount_input = st.text_input(
+                            discount_input = _money_input(
                                 "Descuento del depósito (USD)", value="00,00",
                                 help="Ingresa el descuento manualmente. Si no hay descuento, indica 00,00.",
                                 key=f"{key}_refund_deduction",
@@ -1602,7 +1941,7 @@ def _render_residents(
                             )
                         try:
                             original = Decimal(deposit["amount"] or "")
-                            discount_preview = Decimal(discount_input.replace(",", "."))
+                            discount_preview = parse_money(discount_input)
                             if (
                                 not original.is_finite() or original <= 0
                                 or not discount_preview.is_finite()
@@ -1612,8 +1951,8 @@ def _render_residents(
                                 st.error("El descuento debe estar entre cero y el depósito, con máximo dos decimales.")
                             else:
                                 st.info(
-                                    f"Depósito original: USD {original:.2f}. "
-                                    f"Total a reembolsar: USD {original - discount_preview:.2f}."
+                                    f"Depósito original: USD {format_money(original)}. "
+                                    f"Total a reembolsar: USD {format_money(original - discount_preview)}."
                                 )
                         except InvalidOperation:
                             st.error("No se puede calcular la devolución: verifica el monto y el descuento.")
@@ -1643,7 +1982,7 @@ def _render_residents(
                             store.discharge(
                                 resident.id, tab_index, today, reason,
                                 keys_returned=keys_returned, inspection_ok=inspection_ok,
-                                deduction=Decimal(discount_input.replace(",", ".")),
+                                deduction=parse_money(discount_input),
                                 deduction_reason=deduction_reason, refund_method=refund_method,
                                 refund_confirmed=refund_confirmed,
                             )
@@ -1675,12 +2014,15 @@ def _render_residents(
                 st.markdown("**Historial de pagos**")
             if deposit is not None:
                 st.markdown("**Pago de depósito**")
-                st.table([{
+                st.table(style_table([{
                     "Pago registrado": date.fromisoformat(deposit["paid_on"]).strftime("%d/%m/%Y"),
                     "Moneda": deposit["currency"] or "No registrado",
-                    "Cantidad recibida": deposit["amount"] or "No registrado",
+                    "Cantidad recibida": (
+                        format_money(Decimal(deposit["amount"]))
+                        if deposit["amount"] else "No registrado"
+                    ),
                     "Forma de pago": deposit["payment_method"] or "No registrado",
-                }])
+                }]))
                 receipt = store.get_deposit_receipt(resident.id, tab_index)
                 if receipt is not None:
                     st.download_button(
@@ -1695,7 +2037,7 @@ def _render_residents(
                     st.info("Este depósito anterior no tiene un recibo PDF guardado.")
             for item in history:
                 st.markdown("**Pago de mensualidad**")
-                st.table([
+                st.table(style_table([
                     {
                         "Vencimiento cubierto": date.fromisoformat(
                             item["due_date"]
@@ -1710,15 +2052,22 @@ def _render_residents(
                         ),
                         "Cantidad recibida": (
                             f"{'Bs.' if item.get('currency') == 'VES' else '$'} "
-                            f"{item['amount'].replace('.', ',')}"
+                            f"{format_money(Decimal(item['amount']))}"
                             if item.get("amount") and item.get("currency") in {"VES", "USD"}
                             else "No registrado"
                         ),
                         "Forma de pago": item.get("payment_method") or "—",
-                        "Monto base (USD)": item.get("amount_usd") or "—",
-                        "Mensualidad (USD)": item.get("monthly_amount_usd") or "—",
+                        "Monto base (USD)": (
+                            format_money(Decimal(item["amount_usd"])) if item.get("amount_usd") else "—"
+                        ),
+                        "Mensualidad (USD)": (
+                            format_money(Decimal(item["monthly_amount_usd"]))
+                            if item.get("monthly_amount_usd") else "—"
+                        ),
                         "Días de retardo": item.get("late_days") or "—",
-                        "Mora (USD)": item.get("late_fee_usd") or "—",
+                        "Mora (USD)": (
+                            format_money(Decimal(item["late_fee_usd"])) if item.get("late_fee_usd") else "—"
+                        ),
                         "Banco receptor": item.get("receiving_bank") or "—",
                         "Tasa BCV": (
                             f"Bs. {item['exchange_rate'].replace('.', ',')} "
@@ -1727,7 +2076,7 @@ def _render_residents(
                             else "—"
                         ),
                     }
-                ])
+                ]))
                 due_date = date.fromisoformat(item["due_date"])
                 receipt = store.get_payment_receipt(resident.id, tab_index, due_date)
                 if receipt is not None:
@@ -1748,13 +2097,13 @@ def _render_residents(
             for service in store.service_payment_history(resident.id, tab_index):
                 st.markdown("**Pago por otros Servicios**")
                 received = Decimal(service["amount"])
-                st.table([{
+                st.table(style_table([{
                     "Concepto": service["concept"],
                     "Pago registrado": date.fromisoformat(service["paid_on"]).strftime("%d/%m/%Y"),
                     "Moneda": service["currency"],
                     "Cantidad recibida": (
                         f"Bs. {format_bolivars(received)}" if service["currency"] == "VES"
-                        else f"USD {received:.2f}".replace(".", ",")
+                        else f"USD {format_money(received)}"
                     ),
                     "IVA (16%) (Bs.)": (
                         format_bolivars(calculate_receipt_vat(received))
@@ -1765,7 +2114,7 @@ def _render_residents(
                     "Banco receptor": service["receiving_bank"] or "—",
                     "Tasa BCV": service["exchange_rate"] or "—",
                     "Fecha de la tasa": service["exchange_rate_date"] or "—",
-                }])
+                }]))
                 st.download_button(
                     f"Descargar recibo de servicio — {service['concept']} — {service['receipt_number']} (PDF)",
                     data=bytes(service["receipt_pdf"]),
@@ -2016,12 +2365,13 @@ tabs = st.tabs([RESIDENCE_NAMES[index] for index in residence_areas])
 
 for tab_index, tab in zip(residence_areas, tabs):
     with tab:
-        columns = st.columns(5)
+        columns = st.columns(7)
         for card_index, (column, label) in enumerate(zip(
             columns,
             [
                 "Nuevo Ingreso", "Residentes Activas", "Pagos Pendientes",
-                "Residentes de Baja", "Pagos recibidos en el mes",
+                "Residentes de Baja", "Pagos recibidos en el mes", "Control de Gastos",
+                "Pago de IVA (16%)",
             ],
         )):
             with column:
@@ -2036,6 +2386,10 @@ for tab_index, tab in zip(residence_areas, tabs):
                 _render_admission_form(tab_index, resident_store)
             elif view == 4:
                 _render_monthly_received(tab_index, resident_store, can_write=access.can_write)
+            elif view == 5:
+                _render_expenses(tab_index, resident_store, can_write=access.can_write)
+            elif view == 6:
+                _render_vat_payments(tab_index, resident_store, can_write=access.can_write)
             elif view in (1, 2, 3):
                 if access.can_write:
                     _render_residents(
