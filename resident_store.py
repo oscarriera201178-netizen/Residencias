@@ -1,6 +1,5 @@
 import json
 import os
-import secrets
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -180,7 +179,6 @@ class Resident:
     next_payment: date
     discharged_on: date | None
     discharge_reason: str | None
-    client_key: str = ""
 
 
 def payment_status(due: date, today: date) -> str:
@@ -206,7 +204,6 @@ class ResidentStore:
                 CREATE TABLE IF NOT EXISTS residents (
                     id INTEGER PRIMARY KEY,
                     residence INTEGER NOT NULL CHECK (residence IN (0, 1)),
-                    client_key TEXT,
                     identity TEXT NOT NULL,
                     values_json TEXT NOT NULL,
                     documents_json TEXT NOT NULL,
@@ -273,12 +270,6 @@ class ResidentStore:
                     invoice_number TEXT,
                     vat TEXT NOT NULL,
                     registered_on TEXT
-                );
-                CREATE TABLE IF NOT EXISTS client_notifications (
-                    id INTEGER PRIMARY KEY,
-                    kind TEXT NOT NULL CHECK (kind IN ('payment', 'expense')),
-                    payload_json TEXT NOT NULL,
-                    created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS expenses_residence_date
                     ON expenses (residence, paid_on);
@@ -373,20 +364,6 @@ class ResidentStore:
             resident_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(residents)")
             }
-            if "client_key" not in resident_columns:
-                connection.execute("ALTER TABLE residents ADD COLUMN client_key TEXT")
-            missing_client_keys = connection.execute(
-                "SELECT id FROM residents WHERE client_key IS NULL OR client_key = ''"
-            ).fetchall()
-            for row in missing_client_keys:
-                connection.execute(
-                    "UPDATE residents SET client_key=? WHERE id=?",
-                    (secrets.token_hex(24), row["id"]),
-                )
-            connection.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS resident_client_key "
-                "ON residents(client_key)"
-            )
             if "calendar_billing" not in resident_columns:
                 connection.execute(
                     "ALTER TABLE residents ADD COLUMN calendar_billing INTEGER NOT NULL DEFAULT 0"
@@ -480,12 +457,12 @@ class ResidentStore:
             cursor = connection.execute(
                 """
                 INSERT INTO residents (
-                    residence, client_key, identity, values_json, documents_json, pdf, photo,
+                    residence, identity, values_json, documents_json, pdf, photo,
                     admission_date, next_payment, calendar_billing
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
-                    residence, secrets.token_hex(24), identity, json.dumps(values, ensure_ascii=False),
+                    residence, identity, json.dumps(values, ensure_ascii=False),
                     json.dumps(documents), pdf, photo, admission.isoformat(),
                     admission.isoformat(),
                 ),
@@ -499,7 +476,7 @@ class ResidentStore:
         order = "discharged_on DESC, id DESC" if inactive else "next_payment, id"
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT id, residence, client_key, values_json, documents_json, admission_date, "
+                "SELECT id, residence, values_json, documents_json, admission_date, "
                 "next_payment, discharged_on, discharge_reason FROM residents "
                 f"WHERE residence = ? AND discharged_on {condition} "
                 f"ORDER BY {order}",
@@ -508,7 +485,6 @@ class ResidentStore:
         return [
             Resident(
                 id=row["id"], residence=row["residence"],
-                client_key=row["client_key"],
                 values=json.loads(row["values_json"]),
                 documents=json.loads(row["documents_json"]),
                 admission_date=date.fromisoformat(row["admission_date"]),
@@ -519,58 +495,6 @@ class ResidentStore:
                 ),
                 discharge_reason=row["discharge_reason"],
             )
-            for row in rows
-        ]
-
-    def get_resident(self, resident_id: int) -> Resident | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT id,residence,client_key,values_json,documents_json,admission_date,next_payment,"
-                "discharged_on,discharge_reason FROM residents WHERE id=?",
-                (resident_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return Resident(
-            id=row["id"], residence=row["residence"],
-            client_key=row["client_key"],
-            values=json.loads(row["values_json"]),
-            documents=json.loads(row["documents_json"]),
-            admission_date=date.fromisoformat(row["admission_date"]),
-            next_payment=date.fromisoformat(row["next_payment"]),
-            discharged_on=(
-                date.fromisoformat(row["discharged_on"])
-                if row["discharged_on"] else None
-            ),
-            discharge_reason=row["discharge_reason"],
-        )
-
-    @staticmethod
-    def _insert_client_notification(
-        connection: sqlite3.Connection, kind: str, payload: dict[str, object],
-    ) -> None:
-        connection.execute(
-            "INSERT INTO client_notifications(kind,payload_json,created_at) VALUES(?,?,?)",
-            (
-                kind, json.dumps(payload, ensure_ascii=False),
-                datetime.now().astimezone().isoformat(timespec="seconds"),
-            ),
-        )
-
-    def client_notifications(self, limit: int = 100) -> list[dict[str, object]]:
-        if not 1 <= limit <= 200:
-            raise ValueError("El límite de notificaciones debe estar entre 1 y 200.")
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT kind,payload_json,created_at FROM client_notifications "
-                "ORDER BY id DESC LIMIT ?", (limit,),
-            ).fetchall()
-        return [
-            {
-                "kind": row["kind"],
-                "payload": json.loads(row["payload_json"]),
-                "created_at": row["created_at"],
-            }
             for row in rows
         ]
 
@@ -768,10 +692,6 @@ class ResidentStore:
                     invoice_number or None,
                 ),
             )
-            self._insert_client_notification(
-                connection, "payment",
-                {"message": "Se registró un pago recibido.", "residence": residence},
-            )
 
     def record_service_payment(
         self, resident_id: int, residence: int, concept: str, paid_on: date,
@@ -832,10 +752,6 @@ class ResidentStore:
                     invoice_number or None, receipt_number, receipt,
                 ),
             )
-            self._insert_client_notification(
-                connection, "payment",
-                {"message": "Se registró un pago recibido.", "residence": residence},
-            )
 
     def service_payment_history(self, resident_id: int, residence: int) -> list[sqlite3.Row]:
         with self._connect() as connection:
@@ -854,18 +770,6 @@ class ResidentStore:
                 "JOIN residents r ON r.id = p.resident_id "
                 "WHERE r.id = ? AND r.residence = ? AND p.due_date = ?",
                 (resident_id, residence, due_date.isoformat()),
-            ).fetchone()
-        return bytes(row["receipt_pdf"]) if row and row["receipt_pdf"] else None
-
-    def get_service_receipt(
-        self, resident_id: int, residence: int, service_payment_id: int,
-    ) -> bytes | None:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT s.receipt_pdf FROM service_payments s "
-                "JOIN residents r ON r.id=s.resident_id "
-                "WHERE s.id=? AND r.id=? AND r.residence=?",
-                (service_payment_id, resident_id, residence),
             ).fetchone()
         return bytes(row["receipt_pdf"]) if row and row["receipt_pdf"] else None
 
@@ -1114,16 +1018,6 @@ class ResidentStore:
         )
         if cursor.lastrowid is None:
             raise RuntimeError("No se obtuvo el identificador del gasto guardado.")
-        self._insert_client_notification(
-            connection, "expense",
-            {
-                "concept": concept,
-                "paid_on": paid_on.isoformat(),
-                "currency": currency,
-                "amount": str(amount),
-                "residence": residence,
-            },
-        )
         return cursor.lastrowid
 
     @staticmethod
@@ -1266,10 +1160,6 @@ class ResidentStore:
                     resident_id, paid_on.isoformat(), "USD", str(received_amount),
                     payment_method, receipt, receipt_number,
                 ),
-            )
-            self._insert_client_notification(
-                connection, "payment",
-                {"message": "Se registró un pago recibido.", "residence": residence},
             )
 
     def get_deposit_receipt(self, resident_id: int, residence: int) -> bytes | None:

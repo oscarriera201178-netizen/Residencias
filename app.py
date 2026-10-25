@@ -2343,16 +2343,13 @@ st.markdown(
 )
 
 access = require_login()
-if getattr(access, "resident_id", None) is not None:
-    st.info("Esta cuenta es de cliente. Accede desde la aplicación móvil de clientes.")
-    st.stop()
 _render_bcv_ticker()
 residence_areas = select_residence_area(access)
 
 try:
     resident_store = ResidentStore()
     resident_store.authorize_write = access.require_write
-    render_user_management(access, resident_store)
+    render_user_management(access)
 except PermissionError as error:
     st.error(str(error))
     st.stop()

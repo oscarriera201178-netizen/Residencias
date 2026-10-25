@@ -63,15 +63,6 @@ def test_expenses_are_persistent_and_debit_only_the_selected_account(
     assert all(row["amount"] == 0 for row in restored.account_balances(1, TODAY))
     assert len(restored.expenses(1, TODAY)) == 0
     assert sum(row["amount"] for row in restored.account_balances(0, TODAY)) == Decimal("884")
-    notification = restored.client_notifications()[0]
-    assert notification["kind"] == "expense"
-    assert notification["payload"] == {
-        "concept": "Mantenimiento",
-        "paid_on": TODAY.isoformat(),
-        "currency": currency,
-        "amount": "116",
-        "residence": 0,
-    }
 
 
 @pytest.mark.parametrize("amount,expected", [("116", "16.00"), ("100", "13.79"), ("0.04", "0.01")])

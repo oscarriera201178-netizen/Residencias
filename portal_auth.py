@@ -27,10 +27,7 @@ ROLES = {
 LIMITS = {"programmer": 1, "administrator": 1, "viewer": 2}
 IDLE_SECONDS = 30 * 60
 SESSION_SECONDS = 8 * 60 * 60
-CLIENT_IDLE_SECONDS = 30 * 24 * 60 * 60
-CLIENT_SESSION_SECONDS = 30 * 24 * 60 * 60
 AUTH_COOKIE = "residencias_auth"
-CLIENT_AUTH_COOKIE = "residencias_client_auth"
 RESIDENCE_NAMES = ("Residencia Carmen Luisa", "Residencia Las Acacias")
 
 
@@ -67,11 +64,6 @@ class AuthStore:
                     user_id INTEGER NOT NULL REFERENCES users(id),
                     created REAL NOT NULL,
                     touched REAL NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS client_users (
-                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                    resident_id INTEGER NOT NULL UNIQUE,
-                    resident_key TEXT NOT NULL
                 );
             """)
         self.path.chmod(0o600)
@@ -111,8 +103,7 @@ class AuthStore:
 
     def _create(
         self, username: str, password: str, role: str, *,
-        bootstrap: bool = False, token: str = "", client_resident_id: int | None = None,
-        client_resident_key: str = "",
+        bootstrap: bool = False, token: str = "",
     ) -> None:
         username = username.strip().lower()
         if not re.fullmatch(r"[a-z0-9_.-]{3,40}", username):
@@ -132,40 +123,17 @@ class AuthStore:
                 if role == "programmer":
                     raise ValueError("Solo se permite un ADMINISTRADOR PROGRAMADOR.")
             count = connection.execute("SELECT COUNT(*) FROM users WHERE role=?", (role,)).fetchone()[0]
-            if client_resident_id is None and count >= LIMITS[role]:
+            if count >= LIMITS[role]:
                 raise ValueError("Se alcanzó el máximo de cuentas de este perfil. Edita la cuenta existente.")
-            if client_resident_id is not None:
-                if role != "viewer" or client_resident_id <= 0 or not client_resident_key:
-                    raise ValueError("La cuenta de cliente no está asociada a una residente válida.")
-                if connection.execute(
-                    "SELECT 1 FROM client_users WHERE resident_id=?", (client_resident_id,),
-                ).fetchone():
-                    raise ValueError("Esta residente ya tiene una cuenta de cliente.")
             if connection.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
                 raise ValueError("Ese nombre de usuario ya existe.")
-            cursor = connection.execute(
+            connection.execute(
                 "INSERT INTO users(username,role,salt,password_hash,must_change) VALUES(?,?,?,?,?)",
                 (username, role, salt, password_hash, 0 if bootstrap else 1),
             )
-            if client_resident_id is not None:
-                connection.execute(
-                    "INSERT INTO client_users(user_id, resident_id, resident_key) VALUES(?, ?, ?)",
-                    (cursor.lastrowid, client_resident_id, client_resident_key),
-                )
 
     def create_user(self, token: str, username: str, password: str, role: str) -> None:
         self._create(username, password, role, token=token)
-
-    def create_client_user(
-        self, token: str, username: str, password: str,
-        resident_id: int, resident_key: str,
-    ) -> None:
-        if not resident_key or len(resident_key) > 128:
-            raise ValueError("La residente asociada no tiene una clave de acceso válida.")
-        self._create(
-            username, password, "viewer", token=token,
-            client_resident_id=resident_id, client_resident_key=resident_key,
-        )
 
     def login(self, username: str, password: str) -> str:
         if len(password) > 128:
@@ -193,16 +161,8 @@ class AuthStore:
                 token = secrets.token_urlsafe(32)
                 connection.execute("UPDATE users SET failures=0,locked_until=0 WHERE id=?", (user["id"],))
                 connection.execute(
-                    "DELETE FROM sessions WHERE EXISTS ("
-                    "SELECT 1 FROM users u LEFT JOIN client_users cu ON cu.user_id=u.id "
-                    "WHERE u.id=sessions.user_id AND ("
-                    "(cu.user_id IS NULL AND (sessions.created < ? OR sessions.touched < ?)) "
-                    "OR (cu.user_id IS NOT NULL AND "
-                    "(sessions.created < ? OR sessions.touched < ?))))",
-                    (
-                        now - SESSION_SECONDS, now - IDLE_SECONDS,
-                        now - CLIENT_SESSION_SECONDS, now - CLIENT_IDLE_SECONDS,
-                    ),
+                    "DELETE FROM sessions WHERE created < ? OR touched < ?",
+                    (now - SESSION_SECONDS, now - IDLE_SECONDS),
                 )
                 connection.execute(
                     "INSERT INTO sessions VALUES(?,?,?,?)",
@@ -216,19 +176,10 @@ class AuthStore:
         now = time.time()
         key = hashlib.sha256(token.encode()).hexdigest()
         user = connection.execute(
-            "SELECT u.*,s.created,s.touched,cu.resident_id,cu.resident_key FROM users u "
-            "JOIN sessions s ON s.user_id=u.id "
-            "LEFT JOIN client_users cu ON cu.user_id=u.id "
+            "SELECT u.*,s.created,s.touched FROM users u JOIN sessions s ON s.user_id=u.id "
             "WHERE s.token_hash=? AND u.active=1", (key,),
         ).fetchone()
-        is_client = user is not None and user["resident_id"] is not None
-        session_seconds = CLIENT_SESSION_SECONDS if is_client else SESSION_SECONDS
-        idle_seconds = CLIENT_IDLE_SECONDS if is_client else IDLE_SECONDS
-        if (
-            not user
-            or now - user["created"] >= session_seconds
-            or now - user["touched"] >= idle_seconds
-        ):
+        if not user or now - user["created"] >= SESSION_SECONDS or now - user["touched"] >= IDLE_SECONDS:
             raise PermissionError("La sesión venció. Inicia sesión nuevamente.")
         if programmer and (user["role"] != "programmer" or user["must_change"]):
             raise PermissionError("Solo el ADMINISTRADOR PROGRAMADOR puede gestionar usuarios.")
@@ -271,18 +222,7 @@ class AuthStore:
     def users(self, token: str):
         with self.connect() as connection:
             self._session(connection, token, programmer=True)
-            return connection.execute(
-                "SELECT u.id,u.username,u.role,u.active,cu.resident_id "
-                "FROM users u LEFT JOIN client_users cu ON cu.user_id=u.id ORDER BY u.id"
-            ).fetchall()
-
-    def client_resident_ids(self, token: str) -> set[int]:
-        with self.connect() as connection:
-            self._session(connection, token, programmer=True)
-            return {
-                row["resident_id"]
-                for row in connection.execute("SELECT resident_id FROM client_users")
-            }
+            return connection.execute("SELECT id,username,role,active FROM users ORDER BY id").fetchall()
 
     def update_user(self, token: str, user_id: int, active: bool, password: str = "") -> None:
         if password:
@@ -304,7 +244,6 @@ class Access:
     store: AuthStore
     token: str
     role: str
-    resident_id: int | None = None
 
     @property
     def can_write(self) -> bool:
@@ -488,7 +427,7 @@ def require_login() -> Access:
             st.stop()
         with st.sidebar.expander("Cambiar mi contraseña"):
             _password_form(store, token)
-        return Access(store, token, user["role"], user["resident_id"])
+        return Access(store, token, user["role"])
     except PermissionError as error:
         st.session_state.clear()
         st.error(str(error))
@@ -532,7 +471,7 @@ def select_residence_area(access: Access) -> tuple[int, ...]:
     st.stop()
 
 
-def render_user_management(access: Access, resident_store=None) -> None:
+def render_user_management(access: Access) -> None:
     if access.role != "programmer":
         return
     with st.expander("Administración de usuarios"):
@@ -549,50 +488,8 @@ def render_user_management(access: Access, resident_store=None) -> None:
                 st.error(str(error))
             else:
                 st.success("Usuario creado. Entrega la contraseña por un canal privado; deberá cambiarla al entrar.")
-        if resident_store is not None:
-            client_resident_ids = access.store.client_resident_ids(access.token)
-            residents = [
-                resident
-                for residence in (0, 1)
-                for resident in resident_store.list_residents(residence)
-                if resident.id not in client_resident_ids
-            ]
-            st.markdown("**Cuentas de clientes**")
-            if residents:
-                with st.form("create_client_user", clear_on_submit=True):
-                    resident_id = st.selectbox(
-                        "Residente asociada",
-                        residents,
-                        format_func=lambda resident: (
-                            f"{resident.values['student_name']} — "
-                            f"{RESIDENCE_NAMES[resident.residence]}"
-                        ),
-                    )
-                    client_username = st.text_input("Usuario del cliente", max_chars=40)
-                    client_password = st.text_input(
-                        "Contraseña temporal (mínimo 12 caracteres)", type="password",
-                    )
-                    create_client = st.form_submit_button("Crear cuenta de cliente")
-                if create_client:
-                    try:
-                        access.store.create_client_user(
-                            access.token, client_username, client_password, resident_id.id,
-                            resident_id.client_key,
-                        )
-                    except ValueError as error:
-                        st.error(str(error))
-                    else:
-                        st.success(
-                            "Cuenta de cliente creada. Entrega las credenciales por un "
-                            "canal privado; deberá cambiar la contraseña al entrar."
-                        )
-            else:
-                st.info("No hay residentes activas sin una cuenta de cliente.")
         for user in access.store.users(access.token):
-            label = f"{user['username']} — {ROLES[user['role']]}"
-            if user["resident_id"] is not None:
-                label += f" — Cuenta de cliente (residente #{user['resident_id']})"
-            st.write(label)
+            st.write(f"{user['username']} — {ROLES[user['role']]}")
             if user["role"] == "programmer":
                 continue
             with st.form(f"manage_user_{user['id']}", clear_on_submit=True):
